@@ -12,7 +12,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'login' && $_SERVER['REQUEST_M
 
     if ($user) {
         regenerateSession();
-        $_SESSION['user_id']      = rand(1000, 9999);
+        $_SESSION['user_id']      = $user['id'];
         $_SESSION['user_email']   = $email;
         $_SESSION['user_name']    = $user['name'];
         $_SESSION['user_role']    = $user['role'];
@@ -37,12 +37,17 @@ if (isset($_GET['action']) && $_GET['action'] === 'register' && $_SERVER['REQUES
     $firstName = filter_input(INPUT_POST, 'first_name', FILTER_SANITIZE_SPECIAL_CHARS);
     $lastName  = filter_input(INPUT_POST, 'last_name',  FILTER_SANITIZE_SPECIAL_CHARS);
     $email     = filter_input(INPUT_POST, 'email',      FILTER_SANITIZE_EMAIL);
-    regenerateSession();
-    $_SESSION['user_id']      = rand(1000, 9999);
-    $_SESSION['user_email']   = $email;
-    $_SESSION['user_name']    = trim($firstName . ' ' . $lastName);
-    $_SESSION['user_role']    = 'user';
-    $_SESSION['logged_in_at'] = time();
+    $phone     = filter_input(INPUT_POST, 'phone',      FILTER_SANITIZE_SPECIAL_CHARS) ?? '';
+    $password  = $_POST['password'] ?? '';
+    try {
+        $newId = registerUser($firstName, $lastName, $email, $phone, $password);
+        regenerateSession();
+        $_SESSION['user_id']      = $newId;
+        $_SESSION['user_email']   = $email;
+        $_SESSION['user_name']    = trim($firstName . ' ' . $lastName);
+        $_SESSION['user_role']    = 'user';
+        $_SESSION['logged_in_at'] = time();
+    } catch (Exception $e) { error_log($e->getMessage()); }
     header('Location: /queue-system/public/index.php');
     exit();
 }

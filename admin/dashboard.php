@@ -91,6 +91,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     }
 }
 
+// ── Assign Service Admin ─────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'assign_service_admin') {
+    $targetUserId  = (int)($_POST['target_user_id'] ?? 0);
+    $serviceId     = (int)($_POST['service_id']     ?? 0);
+    $canQueue      = isset($_POST['can_manage_queue'])     ? 1 : 0;
+    $canBookings   = isset($_POST['can_manage_bookings'])  ? 1 : 0;
+    $canReports    = isset($_POST['can_view_reports'])     ? 1 : 0;
+    $canLocations  = isset($_POST['can_manage_locations']) ? 1 : 0;
+    $actorId       = (int)($_SESSION['user_id'] ?? 0);
+
+    if (!$targetUserId || !$serviceId) {
+        $formError = 'Please select both a user and a service.';
+    } else {
+        // Upsert assignment
+        $ups = $db->prepare(
+            'INSERT INTO service_admin_assignments
+             (user_id, service_id, assigned_by, can_manage_queue, can_manage_bookings, can_view_reports, can_manage_locations)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               assigned_by           = VALUES(assigned_by),
+               can_manage_queue      = VALUES(can_manage_queue),
+               can_manage_bookings   = VALUES(can_manage_bookings),
+               can_view_reports      = VALUES(can_view_reports),
+               can_manage_locations  = VALUES(can_manage_locations)'
+        );
+        $ups->bind_param('iiiiiii', $targetUserId, $serviceId, $actorId,
+                         $canQueue, $canBookings, $canReports, $canLocations);
+        if ($ups->execute()) {
+            // Only promote to service_admin (role_id=3) if the user is currently
+            // a plain 'user' (role_id=4) or 'client' (role_id=5).
+            // Never silently demote admins/developers, and never silently promote
+            // someone who is already a service_admin.
+            $chkRole = $db->prepare('SELECT role_id FROM users WHERE id = ? LIMIT 1');
+            $chkRole->bind_param('i', $targetUserId);
+            $chkRole->execute();
+            $chkRoleRow = $chkRole->get_result()->fetch_assoc();
+            $chkRole->close();
+
+            $currentRoleId = (int)($chkRoleRow['role_id'] ?? 0);
+            if (in_array($currentRoleId, [4, 5])) {
+                // Safe to promote: plain user or guest client → service_admin
+                $updRole = $db->prepare('UPDATE users SET role_id = 3 WHERE id = ?');
+                $updRole->bind_param('i', $targetUserId);
+                $updRole->execute();
+                $updRole->close();
+                $formSuccess = 'Service admin assignment saved and user role updated to Service Admin.';
+            } else {
+                // User is already admin, developer, or service_admin — leave role untouched
+                $formSuccess = 'Service admin assignment saved successfully. (User role was not changed because they already have an elevated role.)';
+            }
+        } else {
+            $formError = 'Failed to assign service admin. Please try again.';
+        }
+        $ups->close();
+    }
+}
+
+// ── Revoke Service Admin Assignment ─────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'revoke_assignment') {
+    $assignId = (int)($_POST['assignment_id'] ?? 0);
+    if ($assignId) {
+        $del = $db->prepare('DELETE FROM service_admin_assignments WHERE id = ?');
+        $del->bind_param('i', $assignId);
+        $del->execute();
+        $del->close();
+        $formSuccess = 'Assignment revoked successfully.';
+    }
+}
+
 // ── Fetch all users ────────────────────────────────────
 $usersResult = $db->query('
     SELECT u.id, u.first_name, u.last_name, u.email, u.phone,
@@ -104,6 +173,27 @@ $allUsers = $usersResult ? $usersResult->fetch_all(MYSQLI_ASSOC) : [];
 // ── Fetch roles for dropdowns ────────────────────────────────────
 $rolesResult = $db->query('SELECT id, name, label FROM roles ORDER BY id ASC');
 $allRoles    = $rolesResult ? $rolesResult->fetch_all(MYSQLI_ASSOC) : [];
+
+// ── Fetch all booking services ──────────────────────────────────
+$svcResult   = $db->query('SELECT id, slug, name, icon_class, color_hex FROM booking_services WHERE is_active=1 ORDER BY id ASC');
+$allServices = $svcResult ? $svcResult->fetch_all(MYSQLI_ASSOC) : [];
+
+// ── Fetch current service admin assignments ─────────────────────
+$assignResult = $db->query(
+    'SELECT saa.id, saa.user_id, saa.service_id,
+            saa.can_manage_queue, saa.can_manage_bookings, saa.can_view_reports, saa.can_manage_locations,
+            saa.assigned_at,
+            CONCAT(u.first_name," ",u.last_name) AS user_name,
+            u.email AS user_email,
+            bs.name AS service_name, bs.icon_class, bs.color_hex,
+            CONCAT(ab.first_name," ",ab.last_name) AS assigned_by_name
+     FROM service_admin_assignments saa
+     JOIN users u  ON u.id  = saa.user_id
+     JOIN booking_services bs ON bs.id = saa.service_id
+     LEFT JOIN users ab ON ab.id = saa.assigned_by
+     ORDER BY saa.service_id ASC, saa.assigned_at ASC'
+);
+$allAssignments = $assignResult ? $assignResult->fetch_all(MYSQLI_ASSOC) : [];
 
 $pageTitle = 'Admin Dashboard';
 include('../includes/header.php');
@@ -889,6 +979,221 @@ include('../includes/header.php');
         </div>
     </div>
 </div>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SERVICE ADMIN ASSIGNMENTS PANEL
+     ══════════════════════════════════════════════════════════════ -->
+<div class="max-w-7xl mx-auto px-4 sm:px-6 mb-10">
+    <div class="bg-white rounded-2xl shadow-xl border border-slate-100 overflow-hidden">
+        <!-- Header -->
+        <div class="px-6 py-5 bg-gradient-to-r from-white to-slate-50/50 border-b border-slate-100 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-gradient-to-br from-blue-400 to-blue-600 rounded-xl flex items-center justify-center shadow-md">
+                    <i class="fas fa-user-cog text-white text-sm"></i>
+                </div>
+                <div>
+                    <h2 class="font-bold text-slate-800 text-lg">Service Admin Assignments</h2>
+                    <p class="text-xs text-slate-500">Assign service admins to individual queues with granular permissions</p>
+                </div>
+            </div>
+            <button onclick="openModal('modal-assign-service')"
+                class="group relative inline-flex items-center gap-2 px-4 py-2.5 gradient-bg text-white text-sm font-bold rounded-xl shadow-lg hover:shadow-xl transition-all duration-300 transform hover:scale-[1.02]">
+                <i class="fas fa-plus"></i>
+                <span>Assign Admin</span>
+            </button>
+        </div>
+
+        <!-- Current assignments table -->
+        <?php if (empty($allAssignments)): ?>
+        <div class="text-center py-14">
+            <i class="fas fa-user-cog text-5xl text-slate-300 mb-3 block"></i>
+            <p class="text-slate-400 text-sm">No service admin assignments yet.</p>
+            <button onclick="openModal('modal-assign-service')" class="mt-3 text-sm text-[#71C9CE] font-semibold hover:underline">
+                Assign your first service admin →
+            </button>
+        </div>
+        <?php else: ?>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead class="bg-slate-50/80 border-b border-slate-100">
+                    <tr class="text-left">
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Service</th>
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Admin</th>
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Permissions</th>
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Assigned By</th>
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Date</th>
+                        <th class="px-6 py-3 text-xs font-bold text-slate-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-50">
+                <?php foreach ($allAssignments as $a): ?>
+                <tr class="table-row-hover transition-all duration-300">
+                    <td class="px-6 py-4">
+                        <div class="flex items-center gap-2">
+                            <div class="w-8 h-8 rounded-lg flex items-center justify-center text-white text-xs"
+                                 style="background:<?php echo htmlspecialchars($a['color_hex'] ?? '#71C9CE'); ?>">
+                                <i class="fas <?php echo htmlspecialchars($a['icon_class'] ?? 'fa-concierge-bell'); ?>"></i>
+                            </div>
+                            <span class="font-semibold text-slate-700"><?php echo htmlspecialchars($a['service_name']); ?></span>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4">
+                        <div class="flex items-center gap-2">
+                            <div class="w-8 h-8 rounded-full bg-gradient-to-br from-[#E3FDFD] to-[#c5f0f2] flex items-center justify-center text-[#3aabb1] font-bold text-xs">
+                                <?php echo strtoupper(substr($a['user_name'], 0, 1)); ?>
+                            </div>
+                            <div>
+                                <div class="font-medium text-slate-800 text-sm"><?php echo htmlspecialchars($a['user_name']); ?></div>
+                                <div class="text-xs text-slate-400"><?php echo htmlspecialchars($a['user_email']); ?></div>
+                            </div>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4">
+                        <div class="flex flex-wrap gap-1">
+                            <?php if ($a['can_manage_queue']): ?><span class="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded-full font-medium">Queue</span><?php endif; ?>
+                            <?php if ($a['can_manage_bookings']): ?><span class="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full font-medium">Bookings</span><?php endif; ?>
+                            <?php if ($a['can_view_reports']): ?><span class="text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded-full font-medium">Reports</span><?php endif; ?>
+                            <?php if ($a['can_manage_locations']): ?><span class="text-xs px-2 py-0.5 bg-orange-100 text-orange-700 rounded-full font-medium">Locations</span><?php endif; ?>
+                        </div>
+                    </td>
+                    <td class="px-6 py-4 text-slate-500 text-sm"><?php echo htmlspecialchars($a['assigned_by_name'] ?? '—'); ?></td>
+                    <td class="px-6 py-4 text-slate-400 text-xs font-mono"><?php echo date('M j, Y', strtotime($a['assigned_at'])); ?></td>
+                    <td class="px-6 py-4">
+                        <div class="flex items-center gap-2">
+                            <button onclick="openEditAssignment(
+                                    <?php echo $a['id']; ?>,
+                                    <?php echo $a['user_id']; ?>,
+                                    <?php echo $a['service_id']; ?>,
+                                    '<?php echo addslashes($a['user_name']); ?>',
+                                    '<?php echo addslashes($a['service_name']); ?>',
+                                    <?php echo (int)$a['can_manage_queue']; ?>,
+                                    <?php echo (int)$a['can_manage_bookings']; ?>,
+                                    <?php echo (int)$a['can_view_reports']; ?>,
+                                    <?php echo (int)$a['can_manage_locations']; ?>
+                                )"
+                                class="text-xs px-2.5 py-1.5 bg-[#E3FDFD] text-[#3aabb1] rounded-lg font-semibold hover:bg-[#c6f5f7] transition-all">
+                                <i class="fas fa-edit mr-1"></i>Edit
+                            </button>
+                            <form method="POST" class="inline" onsubmit="return confirm('Revoke this assignment?')">
+                                <input type="hidden" name="action"        value="revoke_assignment">
+                                <input type="hidden" name="assignment_id" value="<?php echo $a['id']; ?>">
+                                <button type="submit" class="text-xs px-2.5 py-1.5 bg-red-50 text-red-600 rounded-lg font-semibold hover:bg-red-100 transition-all">
+                                    <i class="fas fa-trash mr-1"></i>Revoke
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+</div>
+
+<!-- MODAL: ASSIGN SERVICE ADMIN -->
+<div id="modal-assign-service" class="modal-overlay" onclick="closeIfOverlay(event,'modal-assign-service')">
+    <div class="modal-box max-w-lg">
+        <form method="POST">
+            <input type="hidden" name="action" value="assign_service_admin">
+            <input type="hidden" name="assignment_edit_id" id="as-edit-id" value="">
+            <div class="relative px-6 py-5 bg-gradient-to-r from-blue-500 to-blue-600 text-white">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <h3 class="text-xl font-bold" id="as-modal-title">Assign Service Admin</h3>
+                        <p class="text-sm opacity-90 mt-0.5" id="as-modal-sub">Grant a user access to manage a service queue</p>
+                    </div>
+                    <button type="button" onclick="closeModal('modal-assign-service')" class="text-white/80 hover:text-white">
+                        <i class="fas fa-times text-xl"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="p-6 space-y-5">
+                <!-- User select -->
+                <div>
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-2">Select User *</label>
+                    <select name="target_user_id" id="as-user-select" required
+                        class="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:border-[#71C9CE] focus:ring-2 focus:ring-[#71C9CE]/20 transition-all">
+                        <option value="">— Choose user —</option>
+                        <?php foreach ($allUsers as $u):
+                            if (in_array($u['role_name'], ['developer', 'admin'])) continue;
+                        ?>
+                        <option value="<?php echo $u['id']; ?>">
+                            <?php echo htmlspecialchars($u['first_name'].' '.$u['last_name']); ?>
+                            (<?php echo htmlspecialchars($u['role_label']); ?>)
+                        </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <!-- Service select -->
+                <div>
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-2">Assign to Service *</label>
+                    <select name="service_id" id="as-service-select" required
+                        class="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:border-[#71C9CE] focus:ring-2 focus:ring-[#71C9CE]/20 transition-all">
+                        <option value="">— Choose service —</option>
+                        <?php foreach ($allServices as $s): ?>
+                        <option value="<?php echo $s['id']; ?>"><?php echo htmlspecialchars($s['name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <!-- Permissions checkboxes -->
+                <div>
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-wider block mb-3">Permissions</label>
+                    <div class="grid grid-cols-2 gap-3">
+                        <?php
+                        $perms = [
+                            ['can_manage_queue',     'fa-list-ol',    'Manage Queue',     'Control queue flow, advance, pause'],
+                            ['can_manage_bookings',  'fa-calendar',   'Manage Bookings',  'View & update appointments'],
+                            ['can_view_reports',     'fa-chart-bar',  'View Reports',     'Access analytics & stats'],
+                            ['can_manage_locations', 'fa-map-marker', 'Manage Locations', 'Edit service location info'],
+                        ];
+                        foreach ($perms as [$name, $icon, $label, $desc]):
+                        ?>
+                        <label class="flex items-start gap-3 p-3 border border-slate-200 rounded-xl cursor-pointer hover:border-[#71C9CE] hover:bg-[#f0fdfd] transition-all group">
+                            <input type="checkbox" name="<?php echo $name; ?>" id="perm-<?php echo $name; ?>"
+                                class="mt-0.5 h-4 w-4 text-[#71C9CE] border-gray-300 rounded"
+                                <?php echo in_array($name, ['can_manage_queue','can_manage_bookings']) ? 'checked' : ''; ?>>
+                            <div>
+                                <div class="text-sm font-semibold text-slate-700 flex items-center gap-1.5">
+                                    <i class="fas <?php echo $icon; ?> text-[#71C9CE] text-xs"></i>
+                                    <?php echo $label; ?>
+                                </div>
+                                <div class="text-xs text-slate-400 mt-0.5"><?php echo $desc; ?></div>
+                            </div>
+                        </label>
+                        <?php endforeach; ?>
+                    </div>
+                </div>
+                <div class="flex gap-2 p-3 bg-blue-50 rounded-xl border border-blue-100 text-xs text-blue-800">
+                    <i class="fas fa-info-circle mt-0.5 text-blue-400 flex-shrink-0"></i>
+                    The user's role will automatically be set to <strong>Service Admin</strong> if it is currently a regular user or client.
+                </div>
+            </div>
+            <div class="px-6 py-5 bg-slate-50/80 border-t border-slate-100 flex gap-3">
+                <button type="button" onclick="closeModal('modal-assign-service')" class="flex-1 px-4 py-2.5 border-2 border-slate-200 text-slate-600 font-bold rounded-xl hover:bg-slate-100 transition-all text-sm">Cancel</button>
+                <button type="submit" class="flex-1 px-4 py-2.5 bg-gradient-to-r from-blue-500 to-blue-600 text-white font-bold rounded-xl hover:shadow-lg transition-all text-sm">
+                    <i class="fas fa-save mr-2"></i><span id="as-submit-label">Save Assignment</span>
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function openEditAssignment(id, userId, svcId, userName, svcName, canQ, canB, canR, canL) {
+    document.getElementById('as-modal-title').textContent = 'Edit Assignment';
+    document.getElementById('as-modal-sub').textContent   = userName + ' → ' + svcName;
+    document.getElementById('as-submit-label').textContent = 'Update Assignment';
+    document.getElementById('as-user-select').value    = userId;
+    document.getElementById('as-service-select').value = svcId;
+    document.getElementById('perm-can_manage_queue').checked     = !!canQ;
+    document.getElementById('perm-can_manage_bookings').checked  = !!canB;
+    document.getElementById('perm-can_view_reports').checked     = !!canR;
+    document.getElementById('perm-can_manage_locations').checked = !!canL;
+    openModal('modal-assign-service');
+}
+</script>
 
 <!-- MODAL: ADD USER - Premium Design -->
 <div id="modal-add-user" class="modal-overlay" onclick="closeIfOverlay(event,'modal-add-user')">

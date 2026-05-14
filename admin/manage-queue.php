@@ -1,8 +1,12 @@
 <?php
+// ============================================================
+//  AquaQueue — manage-queue.php  (DB-connected, role-scoped)
+//  Place in: queue-system/admin/manage-queue.php
+// ============================================================
 session_start();
 require_once('../includes/users_store.php');
 
-// ── Access control ───────────────────────────────────────────────────────
+// ── Access control ───────────────────────────────────────────
 if (!isset($_SESSION['user_role']) || !in_array($_SESSION['user_role'], ['admin', 'developer', 'service_admin'])) {
     $_SESSION['error'] = 'Access denied.';
     header('Location: ../public/login.php');
@@ -11,39 +15,420 @@ if (!isset($_SESSION['user_role']) || !in_array($_SESSION['user_role'], ['admin'
 
 $isServiceAdmin = $_SESSION['user_role'] === 'service_admin';
 $isAdminOrDev   = in_array($_SESSION['user_role'], ['admin', 'developer']);
-$assignedSvc    = $_SESSION['assigned_service'] ?? null; // e.g. 'medical'
+$sessionUserId  = (int)($_SESSION['user_id'] ?? 0);
 
-// All available services (admin/dev see all; service_admin sees only their own)
-$allQueues = [
-    'medical'  => ['title' => 'Medical Consultation', 'current' => 'A-045', 'next' => 'A-046', 'waiting' => 8,  'avg_time' => '15 min', 'status' => 'Active', 'color' => 'from-[#71C9CE] to-[#4db8be]', 'icon' => 'fa-stethoscope'],
-    'salon'    => ['title' => 'Hair Salon',            'current' => 'B-018', 'next' => 'B-019', 'waiting' => 12, 'avg_time' => '25 min', 'status' => 'Busy',   'color' => 'from-pink-500 to-red-400',     'icon' => 'fa-cut'],
-    'dental'   => ['title' => 'Dental Checkup',        'current' => 'C-009', 'next' => 'C-010', 'waiting' => 3,  'avg_time' => '8 min',  'status' => 'Active', 'color' => 'from-teal-500 to-green-400',   'icon' => 'fa-tooth'],
-    'legal'    => ['title' => 'Legal Consultation',    'current' => 'D-015', 'next' => 'D-016', 'waiting' => 5,  'avg_time' => '60 min', 'status' => 'Active', 'color' => 'from-yellow-400 to-orange-400', 'icon' => 'fa-gavel'],
-    'vehicle'  => ['title' => 'Vehicle Service',       'current' => 'E-031', 'next' => 'E-032', 'waiting' => 6,  'avg_time' => '90 min', 'status' => 'Busy',   'color' => 'from-blue-400 to-blue-600',    'icon' => 'fa-car'],
-    'business' => ['title' => 'Business Meeting',      'current' => 'F-007', 'next' => 'F-008', 'waiting' => 2,  'avg_time' => '45 min', 'status' => 'Active', 'color' => 'from-violet-400 to-purple-500', 'icon' => 'fa-briefcase'],
-];
+// ── DB connection ─────────────────────────────────────────────
+$db = new mysqli('localhost', 'root', '', 'aquaqueue_db');
+if ($db->connect_error) die('DB error: ' . $db->connect_error);
+$db->set_charset('utf8mb4');
 
-// Filter to assigned service only for service_admin
-$visibleQueues = $isServiceAdmin && $assignedSvc
-    ? [$assignedSvc => $allQueues[$assignedSvc] ?? reset($allQueues)]
-    : $allQueues;
+// ── Determine which service(s) this user may see ─────────────
+if ($isServiceAdmin) {
+    // Pull the assigned service(s) from service_admin_assignments
+    $saStmt = $db->prepare(
+        'SELECT bs.id, bs.slug, bs.name, bs.icon_class, bs.color_hex,
+                saa.can_manage_queue, saa.can_manage_bookings, saa.can_view_reports
+         FROM service_admin_assignments saa
+         JOIN booking_services bs ON bs.id = saa.service_id
+         WHERE saa.user_id = ? AND bs.is_active = 1'
+    );
+    $saStmt->bind_param('i', $sessionUserId);
+    $saStmt->execute();
+    $assignedServices = $saStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $saStmt->close();
+
+    if (empty($assignedServices)) {
+        die('<div style="font-family:sans-serif;padding:40px;color:#c00">
+             No service assigned to your account yet. Please contact an admin.</div>');
+    }
+    $allowedServiceIds = array_column($assignedServices, 'id');
+} else {
+    // Admin / Developer sees all active services
+    $allSvcResult = $db->query(
+        'SELECT id, slug, name, icon_class, color_hex,
+                1 AS can_manage_queue, 1 AS can_manage_bookings, 1 AS can_view_reports
+         FROM booking_services WHERE is_active = 1 ORDER BY id ASC'
+    );
+    $assignedServices  = $allSvcResult->fetch_all(MYSQLI_ASSOC);
+    $allowedServiceIds = array_column($assignedServices, 'id');
+}
+
+// ── Helper: is a service ID allowed for current user? ─────────
+function isAllowedService(int $svcId, array $allowed): bool {
+    return in_array($svcId, $allowed);
+}
+
+// ── Handle POST actions ───────────────────────────────────────
+$msg = $msgType = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    // ── ADD TO QUEUE ───────────────────────────────────────────
+    if ($action === 'add_queue') {
+        $svcId     = (int)($_POST['service_id']   ?? 0);
+        $locId     = (int)($_POST['location_id']  ?? 0);
+        $custName  = trim($_POST['customer_name'] ?? '');
+        $custPhone = trim($_POST['customer_phone'] ?? '');
+        $priority  = in_array($_POST['priority'] ?? '', ['standard','express','vip'])
+                     ? $_POST['priority'] : 'standard';
+        $qType     = $_POST['queue_type'] ?? 'walk_in';
+        $notes     = trim($_POST['notes'] ?? '');
+
+        if (!$custName || !$svcId || !$locId) {
+            $msg = 'Customer name, service, and location are required.';
+            $msgType = 'error';
+        } elseif (!isAllowedService($svcId, $allowedServiceIds)) {
+            $msg = 'You are not authorised to add to that service queue.';
+            $msgType = 'error';
+        } else {
+            // Get/create today's queue_status row and auto-increment queue number
+            $today = date('Y-m-d');
+            $qs = $db->prepare(
+                'SELECT id, counter_prefix, last_issued FROM queue_status
+                  WHERE location_id = ? AND queue_date = ?'
+            );
+            $qs->bind_param('is', $locId, $today);
+            $qs->execute();
+            $qsRow = $qs->get_result()->fetch_assoc();
+            $qs->close();
+
+            if (!$qsRow) {
+                // Find prefix from service
+                $pfxRes = $db->query(
+                    "SELECT UPPER(SUBSTR(slug,1,1)) AS pfx FROM booking_services WHERE id = $svcId LIMIT 1"
+                );
+                $pfx = $pfxRes ? ($pfxRes->fetch_assoc()['pfx'] ?? 'A') : 'A';
+                $ins2 = $db->prepare(
+                    'INSERT IGNORE INTO queue_status (location_id, queue_date, counter_prefix, last_issued, is_open)
+                     VALUES (?, ?, ?, 0, 1)'
+                );
+                $ins2->bind_param('iss', $locId, $today, $pfx);
+                $ins2->execute();
+                $ins2->close();
+                $qsId      = $db->insert_id;
+                $prefix    = $pfx;
+                $lastIssued = 0;
+            } else {
+                $qsId       = $qsRow['id'];
+                $prefix     = $qsRow['counter_prefix'];
+                $lastIssued = (int)$qsRow['last_issued'];
+            }
+
+            $newNum    = $lastIssued + 1;
+            $queueNo   = sprintf('%s-%03d', $prefix, $newNum);
+            $aptDate   = $today;
+            $aptTime   = date('H:i:s');
+            $basePrice = 0.00;
+
+            // Insert appointment
+            $insApt = $db->prepare(
+                'INSERT INTO appointments
+                 (user_id, service_id, location_id, queue_number, appointment_date,
+                  appointment_time, priority, base_price, notes,
+                  guest_name, guest_phone, status, confirmed_at)
+                 VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "in_queue", NOW())'
+            );
+            $insApt->bind_param(
+                'iisssssdss',
+                $svcId, $locId, $queueNo, $aptDate, $aptTime,
+                $priority, $basePrice, $notes, $custName, $custPhone
+            );
+
+            if ($insApt->execute()) {
+                // Update counter
+                $upd = $db->prepare('UPDATE queue_status SET last_issued = ? WHERE id = ?');
+                $upd->bind_param('ii', $newNum, $qsId);
+                $upd->execute();
+                $upd->close();
+                $msg = "Added <strong>{$custName}</strong> to queue as <strong>{$queueNo}</strong>.";
+                $msgType = 'success';
+            } else {
+                $msg = 'Failed to add to queue. Please try again.';
+                $msgType = 'error';
+            }
+            $insApt->close();
+        }
+    }
+
+    // ── ADVANCE QUEUE (Next) ───────────────────────────────────
+    if ($action === 'next_queue') {
+        $locId = (int)($_POST['location_id'] ?? 0);
+        $svcId = (int)($_POST['service_id']  ?? 0);
+
+        if (!isAllowedService($svcId, $allowedServiceIds)) {
+            $msg = 'Not authorised.'; $msgType = 'error';
+        } else {
+            // Get next in_queue record
+            $nxt = $db->prepare(
+                "SELECT id, queue_number FROM appointments
+                  WHERE service_id=? AND appointment_date=CURDATE() AND status='in_queue'
+                  ORDER BY
+                    CASE priority WHEN 'vip' THEN 1 WHEN 'express' THEN 2 ELSE 3 END,
+                    id ASC
+                  LIMIT 1"
+            );
+            $nxt->bind_param('i', $svcId);
+            $nxt->execute();
+            $nextRow = $nxt->get_result()->fetch_assoc();
+            $nxt->close();
+
+            if ($nextRow) {
+                $upd2 = $db->prepare(
+                    "UPDATE appointments SET status='serving', served_at=NOW() WHERE id=?"
+                );
+                $upd2->bind_param('i', $nextRow['id']);
+                $upd2->execute();
+                $upd2->close();
+
+                // Update current_number in queue_status
+                $upd3 = $db->prepare(
+                    "UPDATE queue_status SET current_number=? WHERE location_id=? AND queue_date=CURDATE()"
+                );
+                $upd3->bind_param('si', $nextRow['queue_number'], $locId);
+                $upd3->execute();
+                $upd3->close();
+
+                $msg = "Now serving <strong>{$nextRow['queue_number']}</strong>.";
+                $msgType = 'success';
+            } else {
+                $msg = 'No more people in queue.';
+                $msgType = 'info';
+            }
+        }
+    }
+
+    // ── PAUSE / RESUME QUEUE ───────────────────────────────────
+    if ($action === 'toggle_pause') {
+        $locId   = (int)($_POST['location_id'] ?? 0);
+        $svcId   = (int)($_POST['service_id']  ?? 0);
+        $paused  = (int)($_POST['paused']       ?? 0);
+        $newPaused = $paused ? 0 : 1;
+
+        if (!isAllowedService($svcId, $allowedServiceIds)) {
+            $msg = 'Not authorised.'; $msgType = 'error';
+        } else {
+            $upd = $db->prepare(
+                "UPDATE queue_status SET is_paused=? WHERE location_id=? AND queue_date=CURDATE()"
+            );
+            $upd->bind_param('ii', $newPaused, $locId);
+            $upd->execute();
+            $upd->close();
+            $msg = $newPaused ? 'Queue paused.' : 'Queue resumed.';
+            $msgType = 'info';
+        }
+    }
+
+    // ── CANCEL APPOINTMENT ─────────────────────────────────────
+    if ($action === 'cancel_apt') {
+        $aptId  = (int)($_POST['apt_id'] ?? 0);
+        $reason = trim($_POST['cancel_reason'] ?? 'Cancelled by admin');
+
+        // Verify this appointment belongs to an allowed service
+        $chk = $db->prepare('SELECT service_id FROM appointments WHERE id = ? LIMIT 1');
+        $chk->bind_param('i', $aptId);
+        $chk->execute();
+        $aptRow = $chk->get_result()->fetch_assoc();
+        $chk->close();
+
+        if (!$aptRow || !isAllowedService((int)$aptRow['service_id'], $allowedServiceIds)) {
+            $msg = 'Not authorised to cancel that appointment.'; $msgType = 'error';
+        } else {
+            $upd = $db->prepare(
+                "UPDATE appointments SET status='cancelled', cancelled_at=NOW(), cancellation_reason=?
+                  WHERE id=?"
+            );
+            $upd->bind_param('si', $reason, $aptId);
+            $upd->execute();
+            $upd->close();
+            $msg = 'Appointment cancelled.'; $msgType = 'success';
+        }
+    }
+
+    // ── MARK NO-SHOW ───────────────────────────────────────────
+    if ($action === 'mark_noshow') {
+        $aptId = (int)($_POST['apt_id'] ?? 0);
+        $chk   = $db->prepare('SELECT service_id FROM appointments WHERE id=? LIMIT 1');
+        $chk->bind_param('i', $aptId);
+        $chk->execute();
+        $aptRow = $chk->get_result()->fetch_assoc();
+        $chk->close();
+
+        if (!$aptRow || !isAllowedService((int)$aptRow['service_id'], $allowedServiceIds)) {
+            $msg = 'Not authorised.'; $msgType = 'error';
+        } else {
+            $upd = $db->prepare("UPDATE appointments SET status='no_show' WHERE id=?");
+            $upd->bind_param('i', $aptId);
+            $upd->execute();
+            $upd->close();
+            $msg = 'Marked as no-show.'; $msgType = 'info';
+        }
+    }
+
+    // ── RESET DAILY COUNTERS (admin/dev only) ─────────────────
+    if ($action === 'reset_counters' && $isAdminOrDev) {
+        $db->query("UPDATE queue_status SET last_issued=0, current_number=NULL WHERE queue_date=CURDATE()");
+        $msg = 'Daily counters reset.'; $msgType = 'success';
+    }
+
+    // Redirect to prevent form re-submit
+    $_SESSION['mq_msg']      = $msg;
+    $_SESSION['mq_msg_type'] = $msgType;
+    header('Location: manage-queue.php');
+    exit();
+}
+
+// Pull flash message
+if (isset($_SESSION['mq_msg'])) {
+    $msg     = $_SESSION['mq_msg'];
+    $msgType = $_SESSION['mq_msg_type'] ?? 'info';
+    unset($_SESSION['mq_msg'], $_SESSION['mq_msg_type']);
+}
+
+// ── Build queue data from DB ──────────────────────────────────
+// For each assigned service get: location(s), queue_status, live appointments
+$serviceData = [];
+foreach ($assignedServices as $svc) {
+    $svcId = $svc['id'];
+
+    // Locations
+    $locRes = $db->prepare(
+        'SELECT id, name, address, phone, hours, price, duration_min, is_active
+           FROM service_locations WHERE service_id=? AND is_active=1 ORDER BY id ASC'
+    );
+    $locRes->bind_param('i', $svcId);
+    $locRes->execute();
+    $locations = $locRes->get_result()->fetch_all(MYSQLI_ASSOC);
+    $locRes->close();
+
+    // Queue status per location (today)
+    $qsData = [];
+    foreach ($locations as $loc) {
+        $locId = $loc['id'];
+        $qsStmt = $db->prepare(
+            "SELECT qs.*, 
+                COUNT(CASE WHEN a.status='in_queue' THEN 1 END)  AS waiting_count,
+                COUNT(CASE WHEN a.status='serving'  THEN 1 END)  AS serving_count,
+                COUNT(CASE WHEN a.status='completed' THEN 1 END) AS done_count
+             FROM queue_status qs
+             LEFT JOIN appointments a ON a.service_id = ? AND a.appointment_date = qs.queue_date
+             WHERE qs.location_id=? AND qs.queue_date=CURDATE()
+             GROUP BY qs.id"
+        );
+        $qsStmt->bind_param('ii', $svcId, $locId);
+        $qsStmt->execute();
+        $row = $qsStmt->get_result()->fetch_assoc();
+        $qsStmt->close();
+
+        if (!$row) {
+            // Auto-create today's status row
+            $pfx = strtoupper(substr($svc['slug'], 0, 1));
+            $ci  = $db->prepare(
+                'INSERT IGNORE INTO queue_status (location_id, queue_date, counter_prefix, last_issued, is_open)
+                 VALUES (?, CURDATE(), ?, 0, 1)'
+            );
+            $ci->bind_param('is', $locId, $pfx);
+            $ci->execute();
+            $ci->close();
+            $row = [
+                'id' => $db->insert_id, 'location_id' => $locId,
+                'counter_prefix' => $pfx, 'last_issued' => 0,
+                'current_number' => null, 'is_paused' => 0, 'is_open' => 1,
+                'waiting_count' => 0, 'serving_count' => 0, 'done_count' => 0,
+            ];
+        }
+        $qsData[$locId] = $row;
+    }
+
+    // Live appointments for today (in_queue + serving)
+    if (!empty($locations)) {
+        $aptStmt = $db->prepare(
+            "SELECT a.id, a.queue_number,
+                    COALESCE(a.guest_name, CONCAT(u.first_name,' ',u.last_name)) AS guest_name,
+                    COALESCE(a.guest_phone, u.phone) AS guest_phone,
+                    a.status, a.priority, a.notes, a.appointment_time
+             FROM appointments a
+             LEFT JOIN users u ON u.id = a.user_id
+             WHERE a.service_id=?
+               AND a.appointment_date=CURDATE()
+               AND a.status IN ('in_queue','serving','pending','confirmed')
+             ORDER BY
+               CASE a.status WHEN 'serving' THEN 0 ELSE 1 END,
+               CASE a.priority WHEN 'vip' THEN 1 WHEN 'express' THEN 2 ELSE 3 END,
+               a.id ASC"
+        );
+        $aptStmt->bind_param('i', $svcId);
+        $aptStmt->execute();
+        $liveAppointments = $aptStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $aptStmt->close();
+    } else {
+        $liveAppointments = [];
+    }
+
+    $serviceData[] = array_merge($svc, [
+        'locations'        => $locations,
+        'queue_status'     => $qsData,
+        'live_appointments'=> $liveAppointments,
+    ]);
+}
+
+// ── Recent completed (last 20, across allowed services) ──────
+if (!empty($allowedServiceIds)) {
+    $ph2  = implode(',', array_fill(0, count($allowedServiceIds), '?'));
+    $recStmt = $db->prepare(
+        "SELECT a.id, a.queue_number, a.guest_name, a.status,
+                a.appointment_time, a.completed_at, a.cancelled_at,
+                bs.name AS service_name
+         FROM appointments a
+         JOIN booking_services bs ON bs.id = a.service_id
+         WHERE a.service_id IN ($ph2)
+           AND a.appointment_date = CURDATE()
+           AND a.status IN ('completed','cancelled','no_show')
+         ORDER BY COALESCE(a.completed_at, a.cancelled_at) DESC
+         LIMIT 20"
+    );
+    $recStmt->bind_param(str_repeat('i', count($allowedServiceIds)), ...$allowedServiceIds);
+    $recStmt->execute();
+    $recentDone = $recStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $recStmt->close();
+} else {
+    $recentDone = [];
+}
 
 $pageTitle = 'Queue Management';
 include('../includes/header.php');
 ?>
 
+<!-- Extra styles -->
+<style>
+.status-badge { display:inline-flex; align-items:center; gap:4px; padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.5px; }
+.badge-serving  { background:#dcfce7; color:#15803d; }
+.badge-in_queue { background:#e0f2fe; color:#0369a1; }
+.badge-pending  { background:#fef9c3; color:#92400e; }
+.badge-confirmed{ background:#ede9fe; color:#5b21b6; }
+.badge-completed{ background:#f1f5f9; color:#475569; }
+.badge-cancelled{ background:#fee2e2; color:#991b1b; }
+.badge-no_show  { background:#fce7f3; color:#9d174d; }
+.priority-vip     { color:#7c3aed; font-weight:800; }
+.priority-express { color:#d97706; font-weight:700; }
+.priority-standard{ color:#64748b; }
+</style>
+
 <div class="max-w-7xl mx-auto">
 
-    <!-- Page header -->
+    <!-- ── Page header ────────────────────────────────────────── -->
     <div class="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
             <h1 class="text-3xl font-bold text-gray-900">Queue Management</h1>
             <p class="text-gray-500 mt-1">
                 <?php if ($isServiceAdmin): ?>
-                    Managing: <strong class="text-[#3aabb1]"><?php echo $visibleQueues[$assignedSvc]['title'] ?? 'Your Service'; ?></strong>
-                    — Service Admin access only
+                    Managing:
+                    <?php foreach ($assignedServices as $i => $s): ?>
+                        <strong class="text-[#3aabb1]"><?php echo htmlspecialchars($s['name']); ?></strong><?php echo $i < count($assignedServices)-1 ? ', ' : ''; ?>
+                    <?php endforeach; ?>
+                    — Service Admin access
                 <?php else: ?>
-                    Manage all queues and appointments in real-time
+                    Full access — all services live view
                 <?php endif; ?>
             </p>
         </div>
@@ -53,260 +438,419 @@ include('../includes/header.php');
                 <i class="fas fa-tachometer-alt mr-2"></i>Dashboard
             </a>
             <?php endif; ?>
-            <button onclick="refreshAll()" class="px-5 py-2 gradient-bg text-white font-semibold rounded-xl hover:opacity-90 text-sm transition-all shadow-sm">
+            <button onclick="location.reload()" class="px-5 py-2 gradient-bg text-white font-semibold rounded-xl hover:opacity-90 text-sm transition-all shadow-sm">
                 <i class="fas fa-sync-alt mr-2"></i>Refresh
             </button>
         </div>
     </div>
 
-    <!-- Service Admin restriction notice -->
+    <!-- ── Flash message ──────────────────────────────────────── -->
+    <?php if ($msg): ?>
+    <div class="mb-6 px-5 py-3.5 rounded-xl text-sm font-semibold flex items-center gap-2 flash-message
+        <?php echo $msgType==='error' ? 'bg-red-50 text-red-700 border border-red-200'
+                : ($msgType==='success' ? 'bg-green-50 text-green-700 border border-green-200'
+                : 'bg-blue-50 text-blue-700 border border-blue-200'); ?>">
+        <i class="fas <?php echo $msgType==='error' ? 'fa-exclamation-circle' : ($msgType==='success' ? 'fa-check-circle' : 'fa-info-circle'); ?>"></i>
+        <?php echo $msg; ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- ── Service Admin notice ───────────────────────────────── -->
     <?php if ($isServiceAdmin): ?>
     <div class="mb-6 bg-[#f0fdfd] border border-[#A6E3E9] rounded-xl p-4 flex items-start gap-3">
         <i class="fas fa-user-cog text-[#71C9CE] mt-0.5 flex-shrink-0"></i>
         <div>
             <div class="font-semibold text-[#3aabb1] text-sm">Service Admin Access</div>
-            <div class="text-gray-500 text-xs mt-0.5">You can only manage your assigned service queue. For system-wide access, contact your main admin.</div>
+            <div class="text-gray-500 text-xs mt-0.5">
+                You can only manage your assigned service(s). For system-wide access, contact your main admin.
+            </div>
         </div>
     </div>
     <?php endif; ?>
 
-    <!-- ── QUEUE CONTROL CARDS ──────────────────────────────────── -->
-    <div class="grid md:grid-cols-<?php echo count($visibleQueues) === 1 ? '1' : (count($visibleQueues) <= 2 ? '2' : '3'); ?> gap-6 mb-8">
-        <?php foreach ($visibleQueues as $key => $q): ?>
-        <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-            <div class="bg-gradient-to-r <?php echo $q['color']; ?> p-6 text-white">
-                <div class="flex justify-between items-center mb-4">
-                    <h3 class="text-lg font-bold leading-tight"><?php echo $q['title']; ?></h3>
-                    <div class="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center">
-                        <i class="fas <?php echo $q['icon']; ?>"></i>
-                    </div>
-                </div>
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <div class="text-sm opacity-80 mb-1">Current</div>
-                        <div class="text-3xl font-bold"><?php echo $q['current']; ?></div>
-                    </div>
-                    <div>
-                        <div class="text-sm opacity-80 mb-1">Next</div>
-                        <div class="text-3xl font-bold"><?php echo $q['next']; ?></div>
-                    </div>
-                </div>
+    <!-- ══════════════════════════════════════════════════════════
+         LOOP: one section per service
+    ══════════════════════════════════════════════════════════ -->
+    <?php foreach ($serviceData as $svc): ?>
+    <?php
+        $svcId    = $svc['id'];
+        $svcSlug  = htmlspecialchars($svc['slug']);
+        $svcName  = htmlspecialchars($svc['name']);
+        $svcIcon  = htmlspecialchars($svc['icon_class'] ?? 'fa-concierge-bell');
+        $svcColor = htmlspecialchars($svc['color_hex'] ?? '#71C9CE');
+        $locs     = $svc['locations'];
+        $liveApts = $svc['live_appointments'];
+        $qsMap    = $svc['queue_status'];
+        $canQueue = (bool)$svc['can_manage_queue'];
+        $canBook  = (bool)$svc['can_manage_bookings'];
+        $canReport= (bool)$svc['can_view_reports'];
+    ?>
+    <div class="mb-10">
+
+        <!-- Service heading -->
+        <div class="flex items-center gap-3 mb-5">
+            <div class="w-10 h-10 rounded-xl flex items-center justify-center text-white text-lg"
+                 style="background:<?php echo $svcColor; ?>">
+                <i class="fas <?php echo $svcIcon; ?>"></i>
             </div>
-            <div class="p-5">
-                <div class="grid grid-cols-2 gap-3 mb-4 text-sm">
-                    <div>
-                        <div class="text-gray-400 text-xs font-medium uppercase tracking-wide">Waiting</div>
-                        <div class="font-semibold text-gray-800 mt-0.5"><?php echo $q['waiting']; ?> people</div>
-                    </div>
-                    <div>
-                        <div class="text-gray-400 text-xs font-medium uppercase tracking-wide">Avg. Time</div>
-                        <div class="font-semibold text-gray-800 mt-0.5"><?php echo $q['avg_time']; ?></div>
-                    </div>
-                </div>
-                <div class="flex gap-2">
-                    <button class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-semibold transition-all">
-                        <i class="fas fa-pause mr-1"></i>Pause
-                    </button>
-                    <button class="flex-1 py-2 bg-[#E3FDFD] hover:bg-[#c6f5f7] text-[#3aabb1] rounded-lg text-xs font-semibold transition-all">
-                        <i class="fas fa-forward mr-1"></i>Next
-                    </button>
-                    <button class="flex-1 py-2 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-xs font-semibold transition-all">
-                        <i class="fas fa-stop mr-1"></i>Stop
-                    </button>
+            <div>
+                <h2 class="text-xl font-bold text-gray-900"><?php echo $svcName; ?></h2>
+                <div class="text-xs text-gray-400 flex gap-3 mt-0.5">
+                    <?php if ($canQueue): ?><span class="text-green-600"><i class="fas fa-check-circle mr-1"></i>Manage Queue</span><?php endif; ?>
+                    <?php if ($canBook): ?><span class="text-green-600"><i class="fas fa-check-circle mr-1"></i>Manage Bookings</span><?php endif; ?>
+                    <?php if ($canReport): ?><span class="text-blue-600"><i class="fas fa-chart-bar mr-1"></i>Reports</span><?php endif; ?>
                 </div>
             </div>
         </div>
-        <?php endforeach; ?>
-    </div>
 
-    <!-- ── DETAILED QUEUE TABLE ─────────────────────────────────── -->
-    <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-8">
-        <div class="flex justify-between items-center mb-6">
-            <h2 class="text-xl font-semibold text-gray-900">Live Queue List</h2>
-            <!-- Filter — only admins/devs see all service filters -->
-            <?php if ($isAdminOrDev): ?>
-            <select class="border border-gray-200 rounded-xl px-3 py-2 text-sm text-gray-600 focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
-                <option value="">All Services</option>
-                <?php foreach ($allQueues as $k => $q): ?>
-                <option value="<?php echo $k; ?>"><?php echo $q['title']; ?></option>
-                <?php endforeach; ?>
-            </select>
+        <!-- ── LOCATION QUEUE STATUS CARDS ──────────────────── -->
+        <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+        <?php foreach ($locs as $loc): ?>
+        <?php
+            $locId   = $loc['id'];
+            $qs      = $qsMap[$locId] ?? [];
+            $waiting = (int)($qs['waiting_count'] ?? 0);
+            $serving = (int)($qs['serving_count']  ?? 0);
+            $done    = (int)($qs['done_count']      ?? 0);
+            $paused  = (int)($qs['is_paused']       ?? 0);
+            $curNum  = $qs['current_number'] ?? '—';
+            $total   = $waiting + $serving + $done;
+        ?>
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+            <!-- Card header -->
+            <div class="px-5 py-4 text-white" style="background:<?php echo $svcColor; ?>">
+                <div class="flex justify-between items-start mb-3">
+                    <div>
+                        <div class="text-xs font-semibold uppercase tracking-widest opacity-80 mb-0.5">Location</div>
+                        <div class="font-bold leading-tight"><?php echo htmlspecialchars($loc['name']); ?></div>
+                        <?php if ($loc['address']): ?>
+                        <div class="text-xs opacity-70 mt-0.5"><?php echo htmlspecialchars($loc['address']); ?></div>
+                        <?php endif; ?>
+                    </div>
+                    <span class="text-xs px-2.5 py-1 rounded-full font-bold
+                        <?php echo $paused ? 'bg-yellow-400 text-yellow-900' : 'bg-white/20 text-white'; ?>">
+                        <?php echo $paused ? 'Paused' : 'Active'; ?>
+                    </span>
+                </div>
+                <div class="grid grid-cols-3 gap-3 text-center">
+                    <div>
+                        <div class="text-xl font-black"><?php echo $curNum; ?></div>
+                        <div class="text-xs opacity-70">Serving</div>
+                    </div>
+                    <div>
+                        <div class="text-xl font-black"><?php echo $waiting; ?></div>
+                        <div class="text-xs opacity-70">Waiting</div>
+                    </div>
+                    <div>
+                        <div class="text-xl font-black"><?php echo $done; ?></div>
+                        <div class="text-xs opacity-70">Done</div>
+                    </div>
+                </div>
+            </div>
+            <!-- Card actions -->
+            <?php if ($canQueue): ?>
+            <div class="px-4 py-3 flex gap-2">
+                <form method="POST" class="flex-1">
+                    <input type="hidden" name="action" value="toggle_pause">
+                    <input type="hidden" name="location_id" value="<?php echo $locId; ?>">
+                    <input type="hidden" name="service_id"  value="<?php echo $svcId; ?>">
+                    <input type="hidden" name="paused"      value="<?php echo $paused; ?>">
+                    <button type="submit" class="w-full py-2 rounded-lg text-xs font-semibold transition-all
+                        <?php echo $paused ? 'bg-green-100 text-green-700 hover:bg-green-200' : 'bg-yellow-50 text-yellow-700 hover:bg-yellow-100'; ?>">
+                        <i class="fas <?php echo $paused ? 'fa-play' : 'fa-pause'; ?> mr-1"></i>
+                        <?php echo $paused ? 'Resume' : 'Pause'; ?>
+                    </button>
+                </form>
+                <form method="POST" class="flex-1">
+                    <input type="hidden" name="action" value="next_queue">
+                    <input type="hidden" name="location_id" value="<?php echo $locId; ?>">
+                    <input type="hidden" name="service_id"  value="<?php echo $svcId; ?>">
+                    <button type="submit" class="w-full py-2 rounded-lg text-xs font-semibold bg-[#E3FDFD] text-[#3aabb1] hover:bg-[#c7f5f7] transition-all"
+                        onclick="return confirm('Advance queue to next customer?')">
+                        <i class="fas fa-forward mr-1"></i>Next
+                    </button>
+                </form>
+            </div>
+            <?php endif; ?>
+        </div>
+        <?php endforeach; ?>
+        <?php if (empty($locs)): ?>
+        <div class="col-span-3 bg-yellow-50 border border-yellow-200 rounded-xl p-4 text-sm text-yellow-700">
+            <i class="fas fa-exclamation-triangle mr-2"></i>No active locations found for this service.
+            <?php if ($isAdminOrDev): ?> <a href="dashboard.php" class="underline">Add one from Dashboard</a>.<?php endif; ?>
+        </div>
+        <?php endif; ?>
+        </div>
+
+        <!-- ── LIVE QUEUE TABLE ───────────────────────────────── -->
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm mb-6">
+            <div class="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
+                <h3 class="font-semibold text-gray-900 flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+                    Live Queue — Today
+                    <span class="text-xs text-gray-400 font-normal">(<?php echo date('M d, Y'); ?>)</span>
+                </h3>
+                <span class="text-xs bg-gray-100 text-gray-600 px-2.5 py-1 rounded-full font-semibold">
+                    <?php echo count($liveApts); ?> active
+                </span>
+            </div>
+            <?php if (empty($liveApts)): ?>
+            <div class="py-12 text-center text-gray-400">
+                <i class="fas fa-inbox text-3xl mb-3 block opacity-30"></i>
+                No active queue entries for today. Add a walk-in below.
+            </div>
+            <?php else: ?>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-50">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <?php foreach (['#','Queue No.','Customer','Service','Priority','Status','Time','Actions'] as $h): ?>
+                            <th class="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap"><?php echo $h; ?></th>
+                            <?php endforeach; ?>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-50">
+                    <?php foreach ($liveApts as $i => $apt): ?>
+                    <tr class="hover:bg-gray-50 transition-colors <?php echo $apt['status']==='serving' ? 'bg-green-50' : ''; ?>">
+                        <td class="px-4 py-3 text-sm text-gray-400"><?php echo $i+1; ?></td>
+                        <td class="px-4 py-3 font-bold text-gray-900 text-sm"><?php echo htmlspecialchars($apt['queue_number']); ?></td>
+                        <td class="px-4 py-3 text-sm">
+                            <div class="font-medium text-gray-800"><?php echo htmlspecialchars($apt['guest_name'] ?? 'N/A'); ?></div>
+                            <?php if ($apt['guest_phone']): ?>
+                            <div class="text-xs text-gray-400"><?php echo htmlspecialchars($apt['guest_phone']); ?></div>
+                            <?php endif; ?>
+                            <?php if ($apt['notes']): ?>
+                            <div class="text-xs text-blue-500 mt-0.5 italic truncate max-w-[140px]" title="<?php echo htmlspecialchars($apt['notes']); ?>">
+                                <?php echo htmlspecialchars($apt['notes']); ?>
+                            </div>
+                            <?php endif; ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap"><?php echo htmlspecialchars($svcName); ?></td>
+                        <td class="px-4 py-3 text-sm whitespace-nowrap priority-<?php echo $apt['priority']; ?>">
+                            <i class="fas <?php echo $apt['priority']==='vip' ? 'fa-crown' : ($apt['priority']==='express' ? 'fa-bolt' : 'fa-user'); ?> mr-1"></i>
+                            <?php echo ucfirst($apt['priority']); ?>
+                        </td>
+                        <td class="px-4 py-3 whitespace-nowrap">
+                            <span class="status-badge badge-<?php echo $apt['status']; ?>">
+                                <?php echo str_replace('_',' ', ucfirst($apt['status'])); ?>
+                            </span>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
+                            <?php echo substr($apt['appointment_time'], 0, 5); ?>
+                        </td>
+                        <td class="px-4 py-3">
+                            <?php if ($canQueue): ?>
+                            <div class="flex items-center gap-2">
+                                <?php if ($apt['status'] === 'in_queue'): ?>
+                                <!-- Start serving -->
+                                <form method="POST" class="inline">
+                                    <input type="hidden" name="action"      value="next_queue">
+                                    <input type="hidden" name="location_id" value="<?php echo $locId; ?>">
+                                    <input type="hidden" name="service_id"  value="<?php echo $svcId; ?>">
+                                    <button type="submit" class="text-green-500 hover:text-green-700 text-sm" title="Call / Serve">
+                                        <i class="fas fa-play-circle"></i>
+                                    </button>
+                                </form>
+                                <?php endif; ?>
+                                <!-- No-show -->
+                                <form method="POST" class="inline">
+                                    <input type="hidden" name="action" value="mark_noshow">
+                                    <input type="hidden" name="apt_id" value="<?php echo $apt['id']; ?>">
+                                    <button type="submit" class="text-yellow-500 hover:text-yellow-700 text-sm" title="Mark No-Show"
+                                        onclick="return confirm('Mark as no-show?')">
+                                        <i class="fas fa-user-slash"></i>
+                                    </button>
+                                </form>
+                                <!-- Cancel -->
+                                <button onclick="openCancelModal(<?php echo $apt['id']; ?>, '<?php echo addslashes($apt['guest_name']); ?>')"
+                                    class="text-red-400 hover:text-red-600 text-sm" title="Cancel">
+                                    <i class="fas fa-times-circle"></i>
+                                </button>
+                            </div>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
             <?php endif; ?>
         </div>
 
+        <!-- ── ADD TO QUEUE FORM ──────────────────────────────── -->
+        <?php if ($canQueue && !empty($locs)): ?>
+        <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-6">
+            <h3 class="font-semibold text-gray-900 mb-4 flex items-center gap-2">
+                <i class="fas fa-user-plus text-[#71C9CE]"></i>
+                Add Walk-In to Queue
+                <?php if ($isServiceAdmin): ?>
+                <span class="text-xs text-gray-400 font-normal ml-1">— <?php echo $svcName; ?></span>
+                <?php endif; ?>
+            </h3>
+            <form method="POST" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                <input type="hidden" name="action"     value="add_queue">
+                <input type="hidden" name="service_id" value="<?php echo $svcId; ?>">
+
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Location *</label>
+                    <select name="location_id" required
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                        <?php foreach ($locs as $l): ?>
+                        <option value="<?php echo $l['id']; ?>"><?php echo htmlspecialchars($l['name']); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Customer Name *</label>
+                    <input type="text" name="customer_name" required placeholder="e.g. Juan Dela Cruz"
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Phone</label>
+                    <input type="tel" name="customer_phone" placeholder="+63 917 000 0000"
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Priority</label>
+                    <select name="priority"
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                        <option value="standard">Standard</option>
+                        <option value="express">Express</option>
+                        <option value="vip">VIP</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Queue Type</label>
+                    <select name="queue_type"
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                        <option value="walk_in">Walk-in</option>
+                        <option value="appointment">Appointment</option>
+                        <option value="online">Online Booking</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold text-gray-500 uppercase mb-1.5">Notes</label>
+                    <input type="text" name="notes" placeholder="Optional notes…"
+                        class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
+                </div>
+                <div class="sm:col-span-2 lg:col-span-3">
+                    <button type="submit" class="px-6 py-2.5 gradient-bg text-white font-semibold rounded-xl hover:opacity-90 text-sm transition-all shadow-sm">
+                        <i class="fas fa-plus-circle mr-2"></i>Add to Queue
+                    </button>
+                </div>
+            </form>
+        </div>
+        <?php endif; ?>
+
+    </div><!-- end service block -->
+    <?php endforeach; ?>
+
+    <!-- ── RECENT COMPLETIONS ──────────────────────────────────── -->
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-8">
+        <h2 class="text-xl font-semibold text-gray-900 mb-5">Today's Completed / Cancelled</h2>
+        <?php if (empty($recentDone)): ?>
+        <div class="text-center text-gray-400 py-8">
+            <i class="fas fa-clipboard-check text-3xl opacity-30 mb-2 block"></i>No completions yet today.
+        </div>
+        <?php else: ?>
         <div class="overflow-x-auto">
-            <table class="min-w-full divide-y divide-gray-100">
+            <table class="min-w-full divide-y divide-gray-50">
                 <thead class="bg-gray-50">
                     <tr>
-                        <?php foreach (['Queue No.','Customer','Service','Check-in','Wait','Status','Actions'] as $h): ?>
+                        <?php foreach (['Queue No.','Customer','Service','Status','Time'] as $h): ?>
                         <th class="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider"><?php echo $h; ?></th>
                         <?php endforeach; ?>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-50">
-                    <?php
-                    $details = [
-                        ['A-046','John Smith',    'Medical Consultation','09:45 AM','25 min','Waiting', '',        'medical'],
-                        ['A-047','Emma Wilson',   'Medical Consultation','10:00 AM','10 min','Next',    '',        'medical'],
-                        ['A-048','Michael Brown', 'Medical Consultation','10:15 AM','Now',   'Serving', 'serving', 'medical'],
-                        ['B-019','Sarah Johnson', 'Hair Salon',          '10:30 AM','35 min','Waiting', '',        'salon'],
-                        ['B-020','David Lee',     'Hair Salon',          '10:45 AM','20 min','Waiting', '',        'salon'],
-                        ['C-010','Robert Chen',   'Dental Checkup',      '11:00 AM','5 min', 'Next',    '',        'dental'],
-                        ['C-011','Lisa Wang',     'Dental Checkup',      '11:15 AM','Now',   'Serving', 'serving', 'dental'],
-                        ['D-016','Miguel Santos', 'Legal Consultation',   '11:30 AM','40 min','Waiting', '',        'legal'],
-                        ['E-032','Grace Tan',     'Vehicle Service',      '09:00 AM','90 min','Waiting', '',        'vehicle'],
-                    ];
-
-                    $statusStyles = [
-                        'Serving' => 'bg-green-100 text-green-800',
-                        'Next'    => 'bg-blue-100 text-blue-800',
-                        'Waiting' => 'bg-yellow-100 text-yellow-800',
-                    ];
-
-                    foreach ($details as [$qnum, $customer, $service, $checkin, $wait, $status, $flag, $svc]):
-                        // Service admin: skip rows not for their service
-                        if ($isServiceAdmin && $svc !== $assignedSvc) continue;
-                    ?>
-                    <tr class="hover:bg-gray-50 transition-colors <?php echo $flag === 'serving' ? 'bg-[#f0fdfd]' : ''; ?>">
-                        <td class="px-4 py-3 font-bold text-gray-900"><?php echo $qnum; ?></td>
-                        <td class="px-4 py-3 text-sm text-gray-700"><?php echo $customer; ?></td>
-                        <td class="px-4 py-3 text-sm text-gray-500"><?php echo $service; ?></td>
-                        <td class="px-4 py-3 text-sm text-gray-500"><?php echo $checkin; ?></td>
-                        <td class="px-4 py-3 text-sm text-gray-600 font-medium"><?php echo $wait; ?></td>
-                        <td class="px-4 py-3">
-                            <span class="px-2.5 py-1 rounded-full text-xs font-semibold <?php echo $statusStyles[$status] ?? 'bg-gray-100 text-gray-700'; ?>">
-                                <?php echo $status; ?>
-                            </span>
-                        </td>
-                        <td class="px-4 py-3">
-                            <div class="flex gap-3">
-                                <button class="text-blue-500 hover:text-blue-700 text-sm" title="Call"><i class="fas fa-phone-alt"></i></button>
-                                <button class="text-green-500 hover:text-green-700 text-sm" title="Start Service"><i class="fas fa-play-circle"></i></button>
-                                <button class="text-yellow-500 hover:text-yellow-700 text-sm" title="Delay"><i class="fas fa-clock"></i></button>
-                                <button class="text-red-400 hover:text-red-600 text-sm" title="Cancel"><i class="fas fa-times"></i></button>
-                            </div>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
+                <?php foreach ($recentDone as $r): ?>
+                <tr class="hover:bg-gray-50">
+                    <td class="px-4 py-3 font-bold text-sm text-gray-800"><?php echo htmlspecialchars($r['queue_number']); ?></td>
+                    <td class="px-4 py-3 text-sm text-gray-700"><?php echo htmlspecialchars($r['guest_name'] ?? '—'); ?></td>
+                    <td class="px-4 py-3 text-sm text-gray-600"><?php echo htmlspecialchars($r['service_name']); ?></td>
+                    <td class="px-4 py-3">
+                        <span class="status-badge badge-<?php echo $r['status']; ?>">
+                            <?php echo str_replace('_',' ', ucfirst($r['status'])); ?>
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-500">
+                        <?php echo $r['completed_at'] ? date('H:i', strtotime($r['completed_at']))
+                                : ($r['cancelled_at'] ? date('H:i', strtotime($r['cancelled_at'])) : '—'); ?>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
                 </tbody>
             </table>
         </div>
+        <?php endif; ?>
     </div>
 
-    <!-- ── CONTROLS: Add to Queue + Settings ────────────────────── -->
-    <div class="grid md:grid-cols-2 gap-8">
+    <!-- ── ADMIN: Bulk actions & reset ───────────────────────── -->
+    <?php if ($isAdminOrDev): ?>
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-8">
+        <h2 class="text-xl font-semibold text-gray-900 mb-5">Admin Bulk Actions</h2>
+        <div class="flex flex-wrap gap-3">
+            <form method="POST" onsubmit="return confirm('Reset ALL daily queue counters?')">
+                <input type="hidden" name="action" value="reset_counters">
+                <button type="submit" class="px-5 py-2.5 bg-green-50 text-green-700 border border-green-200 rounded-xl text-sm font-semibold hover:bg-green-100 transition-all">
+                    <i class="fas fa-redo mr-2"></i>Reset Daily Counters
+                </button>
+            </form>
+            <a href="dashboard.php" class="px-5 py-2.5 bg-[#E3FDFD] text-[#3aabb1] border border-[#A6E3E9] rounded-xl text-sm font-semibold hover:bg-[#c6f5f7] transition-all">
+                <i class="fas fa-users-cog mr-2"></i>Manage Service Admins
+            </a>
+        </div>
+    </div>
+    <?php endif; ?>
 
-        <!-- Add to Queue -->
-        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
-            <h2 class="text-xl font-semibold text-gray-900 mb-5">Add to Queue</h2>
-            <div class="space-y-4">
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1.5">Select Service</label>
-                    <select class="w-full border border-gray-200 rounded-xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]"
-                            <?php echo $isServiceAdmin ? 'disabled' : ''; ?>>
-                        <?php foreach ($visibleQueues as $k => $q): ?>
-                        <option value="<?php echo $k; ?>"><?php echo $q['title']; ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                    <?php if ($isServiceAdmin): ?>
-                    <p class="text-xs text-gray-400 mt-1">Service locked to your assigned queue.</p>
-                    <?php endif; ?>
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1.5">Customer Name</label>
-                    <input type="text" class="w-full border border-gray-200 rounded-xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]" placeholder="Enter customer name">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium text-gray-700 mb-1.5">Phone Number</label>
-                    <input type="tel" class="w-full border border-gray-200 rounded-xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]" placeholder="+63 (917) 000-0000">
-                </div>
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1.5">Priority</label>
-                        <select class="w-full border border-gray-200 rounded-xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
-                            <option>Standard</option>
-                            <option>Express</option>
-                            <option>VIP</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium text-gray-700 mb-1.5">Queue Type</label>
-                        <select class="w-full border border-gray-200 rounded-xl p-3 text-sm focus:outline-none focus:ring-2 focus:ring-[#71C9CE]">
-                            <option>Walk-in</option>
-                            <option>Appointment</option>
-                            <option>Online Booking</option>
-                        </select>
-                    </div>
-                </div>
-                <button class="w-full py-3 gradient-bg text-white font-semibold rounded-xl hover:opacity-90 text-sm transition-all shadow-sm">
-                    <i class="fas fa-plus-circle mr-2"></i>Add to Queue
+</div><!-- end max-w -->
+
+<!-- ── Cancel Modal ──────────────────────────────────────────── -->
+<div id="cancel-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6">
+        <h3 class="text-lg font-bold text-gray-900 mb-1">Cancel Appointment</h3>
+        <p class="text-sm text-gray-500 mb-4">Cancel for <strong id="cancel-name"></strong>?</p>
+        <form method="POST">
+            <input type="hidden" name="action"  value="cancel_apt">
+            <input type="hidden" name="apt_id"  id="cancel-apt-id">
+            <div class="mb-4">
+                <label class="text-xs font-semibold text-gray-500 uppercase block mb-1.5">Reason (optional)</label>
+                <input type="text" name="cancel_reason" placeholder="e.g. Customer request"
+                    class="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:ring-2 focus:ring-[#71C9CE] focus:outline-none">
+            </div>
+            <div class="flex gap-3">
+                <button type="button" onclick="closeCancelModal()"
+                    class="flex-1 py-2.5 border-2 border-gray-200 text-gray-600 rounded-xl text-sm font-semibold hover:bg-gray-50">
+                    Keep It
+                </button>
+                <button type="submit"
+                    class="flex-1 py-2.5 bg-red-500 text-white rounded-xl text-sm font-semibold hover:bg-red-600">
+                    <i class="fas fa-times mr-1"></i>Cancel
                 </button>
             </div>
-        </div>
-
-        <!-- Bulk Actions + Settings -->
-        <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
-            <h2 class="text-xl font-semibold text-gray-900 mb-5">Bulk Actions</h2>
-            <div class="space-y-3">
-                <?php
-                $bulkActions = [
-                    ['fa-forward',      'text-[#71C9CE]', 'bg-[#E3FDFD]', 'Advance All Queues',   'Move all queues to next',   'bg-[#71C9CE]', true],
-                    ['fa-pause',        'text-yellow-600', 'bg-yellow-50', 'Pause All Queues',     'Temporarily halt services', 'bg-yellow-500', true],
-                    ['fa-redo',         'text-green-600',  'bg-green-50',  'Reset Daily Counters', 'Reset for new day',         'bg-green-500',  $isAdminOrDev],
-                    ['fa-times-circle', 'text-red-600',    'bg-red-50',    'Clear All Queues',     'Remove all pending',        'bg-red-500',    $isAdminOrDev],
-                ];
-                foreach ($bulkActions as [$icon, $iconColor, $iconBg, $label, $desc, $btnBg, $show]):
-                    if (!$show) continue;
-                ?>
-                <div class="flex items-center gap-3 p-3 <?php echo $iconBg; ?> rounded-xl border border-transparent hover:border-gray-200 transition-all">
-                    <div class="w-9 h-9 bg-white rounded-lg flex items-center justify-center flex-shrink-0">
-                        <i class="fas <?php echo $icon; ?> <?php echo $iconColor; ?>"></i>
-                    </div>
-                    <div class="flex-1 min-w-0">
-                        <div class="font-semibold text-gray-800 text-sm"><?php echo $label; ?></div>
-                        <div class="text-xs text-gray-500"><?php echo $desc; ?></div>
-                    </div>
-                    <button class="<?php echo $btnBg; ?> text-white px-3 py-1.5 rounded-lg text-xs font-semibold hover:opacity-90 transition-all flex-shrink-0">Run</button>
-                </div>
-                <?php endforeach; ?>
-            </div>
-
-            <!-- Queue Settings toggles -->
-            <div class="mt-6 pt-5 border-t border-gray-100">
-                <h3 class="text-base font-semibold text-gray-900 mb-4">Queue Settings</h3>
-                <div class="space-y-3">
-                    <?php
-                    $toggles = [
-                        ['auto-advance',      'Auto-advance queue',   true],
-                        ['send-notifs',       'Send notifications',    true],
-                        ['allow-walkins',     'Allow walk-ins',        true],
-                        ['require-login',     'Require login to book', false],
-                    ];
-                    foreach ($toggles as [$id, $label, $checked]):
-                    ?>
-                    <div class="flex items-center justify-between">
-                        <span class="text-sm text-gray-600"><?php echo $label; ?></span>
-                        <label class="relative inline-flex cursor-pointer">
-                            <input type="checkbox" id="<?php echo $id; ?>" class="sr-only peer" <?php echo $checked ? 'checked' : ''; ?>>
-                            <div class="w-11 h-6 bg-gray-200 rounded-full peer peer-checked:bg-[#71C9CE] transition-colors after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:after:translate-x-5"></div>
-                        </label>
-                    </div>
-                    <?php endforeach; ?>
-                </div>
-            </div>
-        </div>
-
+        </form>
     </div>
 </div>
 
 <script>
-function refreshAll() {
-    const btn = event.currentTarget;
-    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Refreshing...';
-    setTimeout(() => {
-        btn.innerHTML = '<i class="fas fa-sync-alt mr-2"></i>Refresh';
-    }, 1200);
+function openCancelModal(aptId, name) {
+    document.getElementById('cancel-apt-id').value = aptId;
+    document.getElementById('cancel-name').textContent = name;
+    const m = document.getElementById('cancel-modal');
+    m.classList.remove('hidden');
+    m.classList.add('flex');
 }
+function closeCancelModal() {
+    const m = document.getElementById('cancel-modal');
+    m.classList.add('hidden');
+    m.classList.remove('flex');
+}
+document.getElementById('cancel-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeCancelModal();
+});
 </script>
 
-<?php include('../includes/footer.php'); ?>
+<?php
+$db->close();
+include('../includes/footer.php');
+?>

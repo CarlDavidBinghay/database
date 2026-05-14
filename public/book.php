@@ -1,8 +1,209 @@
 <?php
 session_start();
+require_once('../includes/db.php');
+
+// ── BOOKING POST HANDLER ──────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'book_appointment') {
+
+    $db = new mysqli('localhost', 'root', '', 'aquaqueue_db');
+    $db->set_charset('utf8mb4');
+
+    $serviceSlug = trim($_POST['service_slug']  ?? '');
+    $locationId  = (int)($_POST['location_id']  ?? 0);
+    $aptDate     = trim($_POST['apt_date']       ?? '');
+    $aptTime     = trim($_POST['apt_time']       ?? '');
+    $priority    = in_array($_POST['priority'] ?? '', ['standard','express','vip'])
+                   ? $_POST['priority'] : 'standard';
+    $basePrice   = (float)($_POST['base_price']      ?? 0);
+    $surcharge   = (float)($_POST['priority_surcharge'] ?? 0);
+    $notes       = trim($_POST['notes']          ?? '');
+    $firstName   = trim($_POST['first_name']     ?? '');
+    $lastName    = trim($_POST['last_name']      ?? '');
+    $email       = trim($_POST['email']          ?? '');
+    $phone       = trim($_POST['phone']          ?? '');
+    $userId      = isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null;
+
+    $errors = [];
+    if (!$serviceSlug)               $errors[] = 'Service is required.';
+    if (!$locationId)                $errors[] = 'Location is required.';
+    if (!$aptDate || !strtotime($aptDate)) $errors[] = 'Valid date is required.';
+    if (!$aptTime)                   $errors[] = 'Time is required.';
+    if (!$firstName || !$lastName)   $errors[] = 'Full name is required.';
+    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Valid email is required.';
+
+    if (empty($errors)) {
+        // Get the service id and prefix from slug
+        $svcStmt = $db->prepare('SELECT id, prefix FROM booking_services WHERE slug = ? AND is_active = 1 LIMIT 1');
+        $svcStmt->bind_param('s', $serviceSlug);
+        $svcStmt->execute();
+        $svcRow = $svcStmt->get_result()->fetch_assoc();
+        $svcStmt->close();
+
+        if (!$svcRow) {
+            $errors[] = 'Invalid service selected.';
+        } else {
+            $svcId  = $svcRow['id'];
+            $prefix = strtoupper($svcRow['prefix'] ?? substr($serviceSlug, 0, 1));
+
+            // Get or create queue_status row for today + location
+            $qs = $db->prepare('SELECT id, last_issued FROM queue_status WHERE location_id = ? AND queue_date = ?');
+            $qs->bind_param('is', $locationId, $aptDate);
+            $qs->execute();
+            $qsRow = $qs->get_result()->fetch_assoc();
+            $qs->close();
+
+            if (!$qsRow) {
+                $ins = $db->prepare('INSERT INTO queue_status (location_id, queue_date, counter_prefix, last_issued, is_open) VALUES (?, ?, ?, 0, 1)');
+                $ins->bind_param('iss', $locationId, $aptDate, $prefix);
+                $ins->execute();
+                $qsId       = $db->insert_id;
+                $lastIssued = 0;
+                $ins->close();
+            } else {
+                $qsId       = $qsRow['id'];
+                $lastIssued = (int)$qsRow['last_issued'];
+            }
+
+            $newNum   = $lastIssued + 1;
+            $queueNo  = sprintf('%s-%03d', $prefix, $newNum);
+            $guestName  = $firstName . ' ' . $lastName;
+            $totalPrice = $basePrice + $surcharge;
+
+            // Insert appointment
+            $insApt = $db->prepare(
+                'INSERT INTO appointments
+                 (user_id, service_id, location_id, queue_number, appointment_date,
+                  appointment_time, priority, base_price, notes,
+                  guest_name, guest_email, guest_phone, status, confirmed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "confirmed", NOW())'
+            );
+            $insApt->bind_param(
+                'iiissssdssss',
+                $userId, $svcId, $locationId, $queueNo, $aptDate,
+                $aptTime, $priority, $totalPrice, $notes,
+                $guestName, $email, $phone
+            );
+
+            if ($insApt->execute()) {
+                // Update queue counter
+                $upd = $db->prepare('UPDATE queue_status SET last_issued = ? WHERE id = ?');
+                $upd->bind_param('ii', $newNum, $qsId);
+                $upd->execute();
+                $upd->close();
+
+                $_SESSION['booking_success'] = [
+                    'queue_no'  => $queueNo,
+                    'service'   => $serviceSlug,
+                    'date'      => $aptDate,
+                    'time'      => $aptTime,
+                    'name'      => $guestName,
+                    'priority'  => $priority,
+                    'price'     => $totalPrice,
+                ];
+                $db->close();
+                header('Location: book.php?booked=1');
+                exit();
+            } else {
+                $errors[] = 'Failed to save booking. Please try again.';
+            }
+            $insApt->close();
+        }
+    }
+    $db->close();
+    // Re-render page with errors
+    $_SESSION['booking_errors'] = $errors;
+    header('Location: book.php?error=1');
+    exit();
+}
+
 $pageTitle = "Book Appointment";
 include('../includes/header.php');
 ?>
+
+<?php
+// Show booking success banner
+if (isset($_GET['booked']) && isset($_SESSION['booking_success'])):
+    $bk = $_SESSION['booking_success'];
+    unset($_SESSION['booking_success']);
+?>
+<div class="max-w-6xl mx-auto mb-6">
+    <div class="bg-green-50 border border-green-200 rounded-2xl p-6 flex items-start gap-4">
+        <div class="w-12 h-12 bg-green-100 rounded-full flex items-center justify-center flex-shrink-0">
+            <i class="fas fa-check-circle text-green-500 text-xl"></i>
+        </div>
+        <div class="flex-1">
+            <h3 class="font-bold text-green-800 text-lg">Booking Confirmed!</h3>
+            <p class="text-green-700 text-sm mt-1">
+                Hi <strong><?= htmlspecialchars($bk['name']) ?></strong>, your appointment has been saved and will appear in the service admin's queue.
+            </p>
+            <div class="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                <div class="bg-white rounded-xl px-3 py-2 border border-green-100">
+                    <div class="text-xs text-gray-400 uppercase font-semibold">Queue No.</div>
+                    <div class="font-bold text-[#3aabb1] text-lg"><?= htmlspecialchars($bk['queue_no']) ?></div>
+                </div>
+                <div class="bg-white rounded-xl px-3 py-2 border border-green-100">
+                    <div class="text-xs text-gray-400 uppercase font-semibold">Date</div>
+                    <div class="font-semibold text-gray-800"><?= date('M j, Y', strtotime($bk['date'])) ?></div>
+                </div>
+                <div class="bg-white rounded-xl px-3 py-2 border border-green-100">
+                    <div class="text-xs text-gray-400 uppercase font-semibold">Time</div>
+                    <div class="font-semibold text-gray-800"><?= htmlspecialchars($bk['time']) ?></div>
+                </div>
+                <div class="bg-white rounded-xl px-3 py-2 border border-green-100">
+                    <div class="text-xs text-gray-400 uppercase font-semibold">Priority</div>
+                    <div class="font-semibold text-gray-800 capitalize"><?= htmlspecialchars($bk['priority']) ?></div>
+                </div>
+            </div>
+            <div class="mt-3 flex gap-3">
+                <a href="queue.php" class="px-4 py-2 bg-[#71C9CE] text-white text-sm font-semibold rounded-xl hover:bg-[#5ab4b9] transition-all">
+                    <i class="fas fa-list-ol mr-1"></i>View My Queue
+                </a>
+                <a href="book.php" class="px-4 py-2 border border-gray-200 text-gray-600 text-sm font-semibold rounded-xl hover:bg-gray-50 transition-all">
+                    Book Another
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<?php
+// Show booking errors
+if (isset($_GET['error']) && isset($_SESSION['booking_errors'])):
+    $errs = $_SESSION['booking_errors'];
+    unset($_SESSION['booking_errors']);
+?>
+<div class="max-w-6xl mx-auto mb-6">
+    <div class="bg-red-50 border border-red-200 rounded-2xl p-5 flex items-start gap-3">
+        <i class="fas fa-exclamation-circle text-red-500 mt-0.5 flex-shrink-0 text-xl"></i>
+        <div>
+            <div class="font-semibold text-red-800 mb-1">Booking failed — please fix the following:</div>
+            <ul class="text-red-700 text-sm list-disc list-inside space-y-0.5">
+                <?php foreach ($errs as $e): ?>
+                <li><?= htmlspecialchars($e) ?></li>
+                <?php endforeach; ?>
+            </ul>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
+
+<!-- Hidden booking form — submitted by JS confirmBooking() -->
+<form id="booking-form" method="POST" action="book.php" style="display:none">
+    <input type="hidden" name="action"              value="book_appointment">
+    <input type="hidden" name="service_slug"        id="hf-service-slug">
+    <input type="hidden" name="location_id"         id="hf-location-id">
+    <input type="hidden" name="apt_date"            id="hf-apt-date">
+    <input type="hidden" name="apt_time"            id="hf-apt-time">
+    <input type="hidden" name="priority"            id="hf-priority">
+    <input type="hidden" name="base_price"          id="hf-base-price">
+    <input type="hidden" name="priority_surcharge"  id="hf-surcharge">
+    <input type="hidden" name="notes"               id="hf-notes">
+    <input type="hidden" name="first_name"          id="hf-first">
+    <input type="hidden" name="last_name"           id="hf-last">
+    <input type="hidden" name="email"               id="hf-email">
+    <input type="hidden" name="phone"               id="hf-phone">
+</form>
 
 <style>
 .modal-overlay {
@@ -532,8 +733,17 @@ function renderStars(float $r): string {
                                     onclick="openEmail('<?= htmlspecialchars(addslashes($p['name'])) ?>', '<?= $svcKey ?>')">
                                 <i class="fas fa-envelope"></i> Email
                             </button>
+                            <?php
+                            // Look up DB location_id for this specific location
+                            $locDbId = 0;
+                            $locLookup = (new mysqli('localhost','root','','aquaqueue_db'));
+                            $locLookup->set_charset('utf8mb4');
+                            $locQ = $locLookup->prepare('SELECT sl.id FROM service_locations sl JOIN booking_services bs ON bs.id=sl.service_id WHERE bs.slug=? AND sl.is_active=1 ORDER BY sl.id ASC LIMIT 1 OFFSET ?');
+                            if ($locQ) { $locQ->bind_param('si', $svcKey, $idx); $locQ->execute(); $locQ->bind_result($locDbId); $locQ->fetch(); $locQ->close(); }
+                            $locLookup->close();
+                            ?>
                             <button class="btn-info btn-book"
-                                    onclick="selectLocation('<?= $svcKey ?>', '<?= htmlspecialchars(addslashes($p['name'])) ?>', <?= $p['price'] ?>, <?= $p['duration'] ?>)">
+                                    onclick="selectLocation('<?= $svcKey ?>', '<?= htmlspecialchars(addslashes($p['name'])) ?>', <?= $p['price'] ?>, <?= $p['duration'] ?>, <?= (int)$locDbId ?>)">
                                 <i class="fas fa-calendar-check"></i> Book
                             </button>
                         </div>
@@ -853,15 +1063,27 @@ function renderStars(float $r): string {
 
 <script>
 /* ── State ─────────────────────────────────────────────────── */
-let selectedService   = '';
-let selectedLocation  = '';
-let selectedPrice     = 0;
-let selectedDuration  = 0;
-let selectedDate      = null;
-let selectedTime      = null;
-let prioritySurcharge = 0;
+let selectedService    = '';
+let selectedLocation   = '';
+let selectedLocationId = 0;
+let selectedPrice      = 0;
+let selectedDuration   = 0;
+let selectedDate       = null;
+let selectedTime       = null;
+let prioritySurcharge  = 0;
 
 const IS_LOGGED_IN = <?= isset($_SESSION['user_id']) ? 'true' : 'false' ?>;
+
+// DB location IDs per service (populated from PHP/DB)
+const LOCATION_IDS = <?php
+    $db2 = new mysqli('localhost','root','','aquaqueue_db');
+    $db2->set_charset('utf8mb4');
+    $map = [];
+    $res = $db2->query('SELECT sl.id, bs.slug FROM service_locations sl JOIN booking_services bs ON bs.id=sl.service_id WHERE sl.is_active=1 ORDER BY bs.slug, sl.id ASC');
+    if ($res) { while ($r = $res->fetch_assoc()) { $map[$r['slug']][] = $r['id']; } }
+    $db2->close();
+    echo json_encode($map);
+?>;
 
 let calYear  = new Date().getFullYear();
 let calMonth = new Date().getMonth();
@@ -1044,17 +1266,42 @@ function confirmBooking() {
     if (!lastName)  { alert('Please enter your last name.');  return; }
     if (!email)     { alert('Please enter your email address.'); return; }
 
+    const priorityVal = prioritySurcharge === 0 ? 'standard' : prioritySurcharge === 200 ? 'express' : 'vip';
+
     if (!IS_LOGGED_IN) {
-        const label    = serviceLabels[selectedService] || selectedService;
-        const total    = selectedPrice + prioritySurcharge;
-        const priority = prioritySurcharge === 0 ? 'Standard' : prioritySurcharge === 200 ? 'Express' : 'VIP';
+        const label = serviceLabels[selectedService] || selectedService;
+        const total = selectedPrice + prioritySurcharge;
         document.getElementById('login-modal-summary').textContent =
-            `${label} • ${selectedLocation} • ${formatDate(selectedDate)} • ${selectedTime} • ₱${total.toLocaleString()} (${priority})`;
+            `${label} • ${selectedLocation} • ${formatDate(selectedDate)} • ${selectedTime} • ₱${total.toLocaleString()} (${priorityVal})`;
         document.getElementById('login-modal').classList.add('active');
         document.body.style.overflow = 'hidden';
     } else {
-        alert(`Booking confirmed for ${firstName} ${lastName}! Redirecting to your appointments…`);
-        // window.location.href = '../appointments.php';
+        // Convert "09:00 AM" → "09:00:00" for MySQL
+        const [timePart, ampm] = selectedTime.split(' ');
+        let [hh, mm] = timePart.split(':').map(Number);
+        if (ampm === 'PM' && hh !== 12) hh += 12;
+        if (ampm === 'AM' && hh === 12) hh = 0;
+        const timeSQL = String(hh).padStart(2,'0') + ':' + String(mm).padStart(2,'0') + ':00';
+
+        // Get location_id: use stored selectedLocationId if available, otherwise look up from LOCATION_IDS
+        let locId = selectedLocationId;
+        if (!locId && LOCATION_IDS[selectedService] && LOCATION_IDS[selectedService].length > 0) {
+            locId = LOCATION_IDS[selectedService][0];
+        }
+
+        document.getElementById('hf-service-slug').value = selectedService;
+        document.getElementById('hf-location-id').value  = locId;
+        document.getElementById('hf-apt-date').value     = selectedDate;
+        document.getElementById('hf-apt-time').value     = timeSQL;
+        document.getElementById('hf-priority').value     = priorityVal;
+        document.getElementById('hf-base-price').value   = selectedPrice;
+        document.getElementById('hf-surcharge').value    = prioritySurcharge;
+        document.getElementById('hf-notes').value        = document.getElementById('booking-notes').value;
+        document.getElementById('hf-first').value        = firstName;
+        document.getElementById('hf-last').value         = lastName;
+        document.getElementById('hf-email').value        = email;
+        document.getElementById('hf-phone').value        = phone;
+        document.getElementById('booking-form').submit();
     }
 }
 
@@ -1067,13 +1314,14 @@ function showLocations(type) {
     selectedService = type;
 }
 
-function selectLocation(service, name, price, duration) {
-    selectedLocation  = name;
-    selectedPrice     = price;
-    selectedDuration  = duration;
-    selectedDate      = null;
-    selectedTime      = null;
-    prioritySurcharge = 0;
+function selectLocation(service, name, price, duration, locationId) {
+    selectedLocation   = name;
+    selectedLocationId = locationId || 0;
+    selectedPrice      = price;
+    selectedDuration   = duration;
+    selectedDate       = null;
+    selectedTime       = null;
+    prioritySurcharge  = 0;
 
     document.querySelectorAll('input[name="priority"]').forEach(r => { r.checked = (r.value === '0'); });
 
