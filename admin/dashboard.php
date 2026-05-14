@@ -119,28 +119,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'assig
         $ups->bind_param('iiiiiii', $targetUserId, $serviceId, $actorId,
                          $canQueue, $canBookings, $canReports, $canLocations);
         if ($ups->execute()) {
-            // Only promote to service_admin (role_id=3) if the user is currently
-            // a plain 'user' (role_id=4) or 'client' (role_id=5).
-            // Never silently demote admins/developers, and never silently promote
-            // someone who is already a service_admin.
-            $chkRole = $db->prepare('SELECT role_id FROM users WHERE id = ? LIMIT 1');
-            $chkRole->bind_param('i', $targetUserId);
-            $chkRole->execute();
-            $chkRoleRow = $chkRole->get_result()->fetch_assoc();
-            $chkRole->close();
-
-            $currentRoleId = (int)($chkRoleRow['role_id'] ?? 0);
-            if (in_array($currentRoleId, [4, 5])) {
-                // Safe to promote: plain user or guest client → service_admin
-                $updRole = $db->prepare('UPDATE users SET role_id = 3 WHERE id = ?');
-                $updRole->bind_param('i', $targetUserId);
-                $updRole->execute();
-                $updRole->close();
-                $formSuccess = 'Service admin assignment saved and user role updated to Service Admin.';
-            } else {
-                // User is already admin, developer, or service_admin — leave role untouched
-                $formSuccess = 'Service admin assignment saved successfully. (User role was not changed because they already have an elevated role.)';
-            }
+            // Only promote plain users (role_id 4 = user, 5 = client) to service_admin.
+            // Never touch developers (1), main admins (2), or already-service_admins (3).
+            $updRole = $db->prepare(
+                'UPDATE users SET role_id = 3 WHERE id = ? AND role_id IN (4, 5)'
+            );
+            $updRole->bind_param('i', $targetUserId);
+            $updRole->execute();
+            $updRole->close();
+            $formSuccess = 'Service admin assignment saved successfully.';
         } else {
             $formError = 'Failed to assign service admin. Please try again.';
         }
@@ -152,10 +139,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'assig
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'revoke_assignment') {
     $assignId = (int)($_POST['assignment_id'] ?? 0);
     if ($assignId) {
+        // Get the user_id before deleting
+        $getUser = $db->prepare('SELECT user_id FROM service_admin_assignments WHERE id = ?');
+        $getUser->bind_param('i', $assignId);
+        $getUser->execute();
+        $revokedRow = $getUser->get_result()->fetch_assoc();
+        $getUser->close();
+
         $del = $db->prepare('DELETE FROM service_admin_assignments WHERE id = ?');
         $del->bind_param('i', $assignId);
         $del->execute();
         $del->close();
+
+        // If the user has no remaining assignments, downgrade them back to plain user (role_id 4)
+        if ($revokedRow) {
+            $revokedUserId = (int)$revokedRow['user_id'];
+            $countStmt = $db->prepare('SELECT COUNT(*) AS cnt FROM service_admin_assignments WHERE user_id = ?');
+            $countStmt->bind_param('i', $revokedUserId);
+            $countStmt->execute();
+            $countRow = $countStmt->get_result()->fetch_assoc();
+            $countStmt->close();
+
+            if ((int)$countRow['cnt'] === 0) {
+                $downgrade = $db->prepare('UPDATE users SET role_id = 4 WHERE id = ? AND role_id = 3');
+                $downgrade->bind_param('i', $revokedUserId);
+                $downgrade->execute();
+                $downgrade->close();
+            }
+        }
+
         $formSuccess = 'Assignment revoked successfully.';
     }
 }
@@ -194,6 +206,129 @@ $assignResult = $db->query(
      ORDER BY saa.service_id ASC, saa.assigned_at ASC'
 );
 $allAssignments = $assignResult ? $assignResult->fetch_all(MYSQLI_ASSOC) : [];
+
+// ═══════════════════════════════════════════════════════════════
+//  LIVE DASHBOARD STATS — all pulled from DB
+// ═══════════════════════════════════════════════════════════════
+
+// 1) Today's visitors (appointments today with status != cancelled/no_show)
+$r = $db->query("SELECT COUNT(*) AS cnt FROM appointments WHERE appointment_date = CURDATE() AND status NOT IN ('cancelled','no_show')");
+$todayVisitors = $r ? (int)$r->fetch_assoc()['cnt'] : 0;
+
+// 2) Average wait time today (seconds from created_at → served_at for served/completed today)
+$r = $db->query("SELECT AVG(TIMESTAMPDIFF(MINUTE, created_at, served_at)) AS avg_wait
+                 FROM appointments
+                 WHERE appointment_date = CURDATE() AND served_at IS NOT NULL");
+$avgWaitMin = $r ? round((float)($r->fetch_assoc()['avg_wait'] ?? 0), 1) : 0;
+$avgWaitStr = $avgWaitMin > 0 ? $avgWaitMin . ' min' : 'N/A';
+
+// 3) Satisfaction proxy: % completed vs total served today
+$r = $db->query("SELECT
+                    SUM(status = 'completed') AS done,
+                    SUM(status IN ('completed','no_show','cancelled')) AS total
+                 FROM appointments WHERE appointment_date = CURDATE()");
+$row = $r ? $r->fetch_assoc() : null;
+$satisfactionPct = ($row && $row['total'] > 0) ? round(($row['done'] / $row['total']) * 100) : 0;
+
+// 4) Pending appointments (all dates, status pending or confirmed not yet served)
+$r = $db->query("SELECT COUNT(*) AS cnt FROM appointments WHERE status IN ('pending','confirmed')");
+$pendingCount = $r ? (int)$r->fetch_assoc()['cnt'] : 0;
+
+// 5) Active queues — live data per service (in_queue + serving today)
+$activeQueuesResult = $db->query(
+    "SELECT bs.name AS service_name, bs.icon_class,
+            COALESCE(qs.current_number, '—') AS current_token,
+            COUNT(CASE WHEN a.status='in_queue'  THEN 1 END) AS waiting,
+            COUNT(CASE WHEN a.status='serving'   THEN 1 END) AS serving_now,
+            bs.id AS service_id,
+            CASE
+                WHEN COUNT(CASE WHEN a.status='serving' THEN 1 END) > 0 THEN 'Serving'
+                WHEN COUNT(CASE WHEN a.status='in_queue' THEN 1 END) > 8 THEN 'Busy'
+                WHEN COUNT(CASE WHEN a.status='in_queue' THEN 1 END) > 3 THEN 'Moderate'
+                ELSE 'Active'
+            END AS queue_status
+     FROM booking_services bs
+     LEFT JOIN service_locations sl ON sl.service_id = bs.id AND sl.is_active = 1
+     LEFT JOIN queue_status qs ON qs.location_id = sl.id AND qs.queue_date = CURDATE()
+     LEFT JOIN appointments a ON a.service_id = bs.id AND a.appointment_date = CURDATE()
+                              AND a.status IN ('in_queue','serving')
+     WHERE bs.is_active = 1
+     GROUP BY bs.id, bs.name, bs.icon_class, qs.current_number
+     ORDER BY bs.id ASC"
+);
+$liveQueues = $activeQueuesResult ? $activeQueuesResult->fetch_all(MYSQLI_ASSOC) : [];
+
+// 6) Today's schedule — next 8 appointments (all statuses except cancelled/no_show)
+$todayScheduleResult = $db->query(
+    "SELECT
+        COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS customer_name,
+        bs.name AS service_name,
+        bs.icon_class,
+        a.appointment_time,
+        a.queue_number,
+        a.status,
+        a.priority
+     FROM appointments a
+     LEFT JOIN users u ON u.id = a.user_id
+     JOIN booking_services bs ON bs.id = a.service_id
+     WHERE a.appointment_date = CURDATE()
+       AND a.status NOT IN ('cancelled','no_show','completed')
+     ORDER BY
+       CASE a.status WHEN 'serving' THEN 0 WHEN 'in_queue' THEN 1 WHEN 'confirmed' THEN 2 ELSE 3 END,
+       a.appointment_time ASC
+     LIMIT 8"
+);
+$todaySchedule = $todayScheduleResult ? $todayScheduleResult->fetch_all(MYSQLI_ASSOC) : [];
+
+// 7) Queue utilization % per service
+$utilizationResult = $db->query(
+    "SELECT bs.name,
+            COUNT(CASE WHEN a.status IN ('in_queue','serving') THEN 1 END) AS active_count,
+            COUNT(*) AS total_count
+     FROM booking_services bs
+     LEFT JOIN appointments a ON a.service_id = bs.id AND a.appointment_date = CURDATE()
+     WHERE bs.is_active = 1
+     GROUP BY bs.id, bs.name
+     ORDER BY bs.id ASC"
+);
+$utilizationData = [];
+if ($utilizationResult) {
+    $colors = ['#71C9CE','#f472b6','#2dd4bf','#fbbf24','#60a5fa','#a78bfa'];
+    $i = 0;
+    while ($row = $utilizationResult->fetch_assoc()) {
+        $total = (int)$row['total_count'];
+        $active = (int)$row['active_count'];
+        $pct = $total > 0 ? min(100, round(($active / max($total,1)) * 100)) : 0;
+        // Scale to at least 5% for visibility if there's any data
+        $utilizationData[] = [
+            'label' => $row['name'],
+            'pct'   => $pct,
+            'color' => $colors[$i % count($colors)],
+        ];
+        $i++;
+    }
+}
+
+// 8) Notification alerts
+$alertsResult = $db->query(
+    "SELECT 'high_wait' AS type,
+            CONCAT(bs.name, ' has ', COUNT(*), ' people waiting') AS message,
+            'fa-hourglass-half' AS icon, 'amber' AS color
+     FROM appointments a
+     JOIN booking_services bs ON bs.id = a.service_id
+     WHERE a.status = 'in_queue' AND a.appointment_date = CURDATE()
+     GROUP BY bs.id, bs.name
+     HAVING COUNT(*) >= 5
+     UNION ALL
+     SELECT 'pending_confirm', CONCAT(COUNT(*), ' appointment(s) awaiting confirmation'), 'fa-calendar-check', 'blue'
+     FROM appointments WHERE status = 'pending'
+     UNION ALL
+     SELECT 'completed_today', CONCAT(COUNT(*), ' appointment(s) completed today'), 'fa-check-circle', 'green'
+     FROM appointments WHERE status = 'completed' AND appointment_date = CURDATE()
+     ORDER BY type ASC
+     LIMIT 5"
+);
+$liveAlerts = $alertsResult ? $alertsResult->fetch_all(MYSQLI_ASSOC) : [];
 
 $pageTitle = 'Admin Dashboard';
 include('../includes/header.php');
@@ -552,10 +687,10 @@ include('../includes/header.php');
         <div class="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-10 stagger-children">
             <?php
             $statItems = [
-                ['value' => '1,248', 'label' => "Today's Visitors", 'icon' => 'fa-users', 'trend' => '+12%', 'trendColor' => 'text-emerald-600', 'bg' => 'from-emerald-400 to-teal-500'],
-                ['value' => '18.5m', 'label' => 'Avg. Wait Time', 'icon' => 'fa-clock', 'trend' => '−2.3 min', 'trendColor' => 'text-rose-600', 'bg' => 'from-rose-400 to-orange-500'],
-                ['value' => '94%', 'label' => 'Satisfaction', 'icon' => 'fa-smile-wink', 'trend' => '↑3%', 'trendColor' => 'text-emerald-600', 'bg' => 'from-emerald-400 to-teal-500'],
-                ['value' => '327', 'label' => 'Pending', 'icon' => 'fa-calendar-alt', 'trend' => 'Stable', 'trendColor' => 'text-slate-500', 'bg' => 'from-slate-400 to-slate-500'],
+                ['value' => number_format($todayVisitors), 'label' => "Today's Visitors", 'icon' => 'fa-users', 'trend' => 'live', 'trendColor' => 'text-emerald-600', 'bg' => 'from-emerald-400 to-teal-500'],
+                ['value' => $avgWaitStr, 'label' => 'Avg. Wait Time', 'icon' => 'fa-clock', 'trend' => 'today', 'trendColor' => 'text-rose-600', 'bg' => 'from-rose-400 to-orange-500'],
+                ['value' => $satisfactionPct . '%', 'label' => 'Completion Rate', 'icon' => 'fa-smile-wink', 'trend' => 'completed today', 'trendColor' => 'text-emerald-600', 'bg' => 'from-emerald-400 to-teal-500'],
+                ['value' => number_format($pendingCount), 'label' => 'Pending Bookings', 'icon' => 'fa-calendar-alt', 'trend' => 'awaiting confirmation', 'trendColor' => 'text-slate-500', 'bg' => 'from-slate-400 to-slate-500'],
             ];
             foreach ($statItems as $idx => $stat):
             ?>
@@ -577,7 +712,7 @@ include('../includes/header.php');
                     <div class="text-xs <?php echo $stat['trendColor']; ?> font-semibold">
                         <?php echo $stat['trend']; ?>
                     </div>
-                    <div class="text-xs text-slate-400">from yesterday</div>
+                    <div class="text-xs text-slate-400">live data</div>
                 </div>
                 <div class="mt-3 h-1 w-full bg-slate-100 rounded-full overflow-hidden">
                     <div class="h-full bg-gradient-to-r <?php echo $stat['bg']; ?> rounded-full progress-bar" style="width: <?php echo rand(60, 95); ?>%"></div>
@@ -623,43 +758,51 @@ include('../includes/header.php');
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-slate-50">
-                                <?php $queues = [
-                                    ['Medical Consultation', 'A-045', '8', 'Active', 'bg-emerald-100 text-emerald-700', '#71C9CE'],
-                                    ['Hair Salon', 'B-018', '12', 'Busy', 'bg-amber-100 text-amber-700', '#f59e0b'],
-                                    ['Dental Checkup', 'C-009', '3', 'Active', 'bg-emerald-100 text-emerald-700', '#71C9CE'],
-                                    ['Legal Consultation', 'D-032', '6', 'Moderate', 'bg-blue-100 text-blue-700', '#3b82f6'],
+                                <?php if (empty($liveQueues)): ?>
+                                <tr><td colspan="5" class="px-6 py-10 text-center text-slate-400 text-sm">No active queues today.</td></tr>
+                                <?php else: ?>
+                                <?php
+                                $statusColorMap = [
+                                    'Serving'  => 'bg-emerald-100 text-emerald-700',
+                                    'Busy'     => 'bg-amber-100 text-amber-700',
+                                    'Moderate' => 'bg-blue-100 text-blue-700',
+                                    'Active'   => 'bg-slate-100 text-slate-600',
                                 ];
-                                foreach ($queues as $q): ?>
+                                foreach ($liveQueues as $q):
+                                    $statusCls = $statusColorMap[$q['queue_status']] ?? 'bg-slate-100 text-slate-600';
+                                    $totalWaiting = (int)$q['waiting'] + (int)$q['serving_now'];
+                                ?>
                                 <tr class="table-row-hover transition-all duration-300">
                                     <td class="px-6 py-3">
                                         <div class="flex items-center gap-2">
                                             <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-[#E3FDFD] to-[#c5f0f2] flex items-center justify-center">
-                                                <i class="fas fa-stethoscope text-[#3aabb1] text-xs"></i>
+                                                <i class="fas <?php echo htmlspecialchars($q['icon_class'] ?? 'fa-concierge-bell'); ?> text-[#3aabb1] text-xs"></i>
                                             </div>
-                                            <span class="font-semibold text-slate-700"><?php echo $q[0]; ?></span>
+                                            <span class="font-semibold text-slate-700"><?php echo htmlspecialchars($q['service_name']); ?></span>
                                         </div>
                                     </td>
-                                    <td class="px-6 py-3 font-mono font-bold text-lg text-slate-800"><?php echo $q[1]; ?></td>
+                                    <td class="px-6 py-3 font-mono font-bold text-lg text-slate-800"><?php echo htmlspecialchars($q['current_token']); ?></td>
                                     <td class="px-6 py-3">
                                         <div class="flex items-center gap-1">
-                                            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-100 text-slate-600 text-xs font-bold"><?php echo $q[2]; ?></span>
+                                            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-100 text-slate-600 text-xs font-bold"><?php echo $totalWaiting; ?></span>
                                             <span class="text-xs text-slate-500">people</span>
                                         </div>
                                     </td>
                                     <td class="px-6 py-3">
-                                        <span class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold <?php echo $q[4]; ?>">
+                                        <span class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold <?php echo $statusCls; ?>">
                                             <span class="w-1.5 h-1.5 rounded-full bg-current animate-pulse"></span>
-                                            <?php echo $q[3]; ?>
+                                            <?php echo htmlspecialchars($q['queue_status']); ?>
                                         </span>
                                     </td>
                                     <td class="px-6 py-3">
-                                        <button class="group relative inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-[#71C9CE] hover:text-white font-medium text-xs transition-all duration-300 hover:bg-[#71C9CE]">
+                                        <a href="manage-queue.php" class="group relative inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-[#71C9CE] hover:text-white font-medium text-xs transition-all duration-300 hover:bg-[#71C9CE]">
                                             <i class="fas fa-forward"></i>
-                                            <span>Next</span>
-                                        </button>
+                                            <span>Manage</span>
+                                        </a>
                                     </td>
                                 </tr>
                                 <?php endforeach; ?>
+                                <?php endif; ?>
                             </tbody>
                         </table>
                     </div>
@@ -683,42 +826,67 @@ include('../includes/header.php');
                         </div>
                     </div>
                     <div class="space-y-3">
-                        <?php $appointments = [
-                            ['Dr. Sarah Johnson', 'Medical Consultation', '10:30 AM', 'A-048', 'In Queue', 'border-l-emerald-500'],
-                            ['Emma Wilson', 'Hair Salon', '11:15 AM', 'B-019', 'Waiting', 'border-l-amber-500'],
-                            ['Robert Chen', 'Dental Checkup', '2:00 PM', 'C-010', 'Scheduled', 'border-l-blue-500'],
-                            ['Michael Brown', 'Legal Consultation', '3:30 PM', 'D-016', 'Confirmed', 'border-l-purple-500'],
+                        <?php if (empty($todaySchedule)): ?>
+                        <div class="text-center py-8 text-slate-400 text-sm">
+                            <i class="fas fa-calendar-times text-3xl opacity-30 mb-2 block"></i>
+                            No appointments scheduled for today.
+                        </div>
+                        <?php else: ?>
+                        <?php
+                        $statusBorderMap = [
+                            'serving'   => 'border-l-emerald-500',
+                            'in_queue'  => 'border-l-[#71C9CE]',
+                            'confirmed' => 'border-l-purple-500',
+                            'pending'   => 'border-l-amber-500',
                         ];
-                        foreach ($appointments as $app): ?>
+                        $statusLabelMap = [
+                            'serving'   => 'Serving',
+                            'in_queue'  => 'In Queue',
+                            'confirmed' => 'Confirmed',
+                            'pending'   => 'Pending',
+                        ];
+                        $dotColorMap = [
+                            'serving'   => 'bg-emerald-500',
+                            'in_queue'  => 'bg-[#71C9CE]',
+                            'confirmed' => 'bg-purple-500',
+                            'pending'   => 'bg-amber-500',
+                        ];
+                        foreach ($todaySchedule as $app):
+                            $border  = $statusBorderMap[$app['status']]  ?? 'border-l-slate-300';
+                            $slabel  = $statusLabelMap[$app['status']]   ?? ucfirst($app['status']);
+                            $dotCls  = $dotColorMap[$app['status']]      ?? 'bg-slate-400';
+                            $timeStr = isset($app['appointment_time']) ? date('h:i A', strtotime($app['appointment_time'])) : '—';
+                        ?>
                         <div class="group flex items-center justify-between p-4 rounded-xl border border-slate-100 bg-white hover:shadow-lg transition-all duration-300 cursor-pointer hover:-translate-y-1">
                             <div class="flex items-center gap-4">
                                 <div class="relative">
                                     <div class="w-10 h-10 rounded-full bg-gradient-to-br from-[#E3FDFD] to-[#c5f0f2] flex items-center justify-center text-[#3aabb1] font-bold text-sm">
-                                        <?php echo substr($app[0], 0, 1); ?>
+                                        <?php echo strtoupper(substr($app['customer_name'] ?? '?', 0, 1)); ?>
                                     </div>
-                                    <div class="absolute -bottom-1 -right-1 w-3 h-3 rounded-full bg-emerald-500 border-2 border-white"></div>
+                                    <div class="absolute -bottom-1 -right-1 w-3 h-3 rounded-full <?php echo $dotCls; ?> border-2 border-white"></div>
                                 </div>
                                 <div>
                                     <div class="font-semibold text-slate-700 text-sm group-hover:text-[#71C9CE] transition-colors">
-                                        <?php echo $app[0]; ?>
+                                        <?php echo htmlspecialchars($app['customer_name'] ?? 'Guest'); ?>
                                     </div>
                                     <div class="text-xs text-slate-400 flex items-center gap-2 mt-0.5">
-                                        <i class="fas fa-stethoscope text-[10px]"></i>
-                                        <?php echo $app[1]; ?>
+                                        <i class="fas <?php echo htmlspecialchars($app['icon_class'] ?? 'fa-calendar'); ?> text-[10px]"></i>
+                                        <?php echo htmlspecialchars($app['service_name']); ?>
                                     </div>
                                 </div>
                             </div>
                             <div class="flex items-center gap-4">
                                 <div class="text-right hidden sm:block">
-                                    <div class="text-sm font-bold text-slate-700"><?php echo $app[2]; ?></div>
-                                    <div class="text-xs text-slate-400 font-mono"><?php echo $app[3]; ?></div>
+                                    <div class="text-sm font-bold text-slate-700"><?php echo $timeStr; ?></div>
+                                    <div class="text-xs text-slate-400 font-mono"><?php echo htmlspecialchars($app['queue_number']); ?></div>
                                 </div>
-                                <span class="px-3 py-1.5 rounded-full text-xs font-bold <?php echo $app[5]; ?> border-l-4 bg-slate-50">
-                                    <?php echo $app[4]; ?>
+                                <span class="px-3 py-1.5 rounded-full text-xs font-bold <?php echo $border; ?> border-l-4 bg-slate-50">
+                                    <?php echo $slabel; ?>
                                 </span>
                             </div>
                         </div>
                         <?php endforeach; ?>
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -787,26 +955,23 @@ include('../includes/header.php');
                         </div>
                     </div>
                     <div class="space-y-4">
-                        <?php $capacities = [
-                            ['Medical Queue', 65, '#71C9CE'],
-                            ['Salon Queue', 85, '#f59e0b'],
-                            ['Dental Queue', 30, '#10b981'],
-                            ['Legal Queue', 50, '#3b82f6'],
-                            ['Vehicle Queue', 40, '#8b5cf6']
-                        ]; ?>
-                        <?php foreach ($capacities as $cap): ?>
+                        <?php if (empty($utilizationData)): ?>
+                        <p class="text-xs text-slate-400 text-center py-4">No data yet today.</p>
+                        <?php else: ?>
+                        <?php foreach ($utilizationData as $cap): ?>
                         <div class="group cursor-pointer">
                             <div class="flex justify-between text-xs mb-1.5">
-                                <span class="font-semibold text-slate-600 group-hover:text-[#71C9CE] transition-colors"><?php echo $cap[0]; ?></span>
-                                <span class="font-bold text-slate-700"><?php echo $cap[1]; ?>%</span>
+                                <span class="font-semibold text-slate-600 group-hover:text-[#71C9CE] transition-colors"><?php echo htmlspecialchars($cap['label']); ?></span>
+                                <span class="font-bold text-slate-700"><?php echo $cap['pct']; ?>%</span>
                             </div>
                             <div class="relative w-full bg-slate-100 rounded-full h-2 overflow-hidden">
-                                <div class="absolute inset-0 bg-gradient-to-r from-<?php echo $cap[2]; ?> to-<?php echo $cap[2]; ?>/50 rounded-full progress-bar" 
-                                     style="width: 0%; animation: progressFill 1s ease forwards;" 
-                                     data-width="<?php echo $cap[1]; ?>"></div>
+                                <div class="h-full rounded-full progress-bar"
+                                     style="width:0%; background:<?php echo $cap['color']; ?>;"
+                                     data-width="<?php echo $cap['pct']; ?>"></div>
                             </div>
                         </div>
                         <?php endforeach; ?>
+                        <?php endif; ?>
                     </div>
                 </div>
 
@@ -817,41 +982,37 @@ include('../includes/header.php');
                             <i class="fas fa-bell text-sm"></i>
                         </div>
                         <div>
-                            <h3 class="font-bold text-slate-800">Notifications</h3>
-                            <p class="text-xs text-slate-500">3 new alerts</p>
+                            <h3 class="font-bold text-slate-800">Live Notifications</h3>
+                            <p class="text-xs text-slate-500"><?php echo count($liveAlerts); ?> active alerts</p>
                         </div>
                     </div>
                     <div class="space-y-3">
-                        <div class="group flex gap-3 p-3 rounded-xl bg-gradient-to-r from-amber-50 to-transparent hover:from-amber-100 transition-all duration-300 cursor-pointer">
-                            <div class="w-8 h-8 rounded-full bg-amber-200 flex items-center justify-center">
-                                <i class="fas fa-hourglass-half text-amber-700 text-xs"></i>
-                            </div>
-                            <div class="flex-1">
-                                <div class="text-sm font-semibold text-amber-800">High wait time</div>
-                                <div class="text-xs text-amber-600">Hair salon queue exceeding 30 min</div>
-                            </div>
-                            <span class="text-xs text-amber-400">2 min ago</span>
+                        <?php if (empty($liveAlerts)): ?>
+                        <div class="text-center py-4 text-slate-400 text-xs">
+                            <i class="fas fa-check-circle text-emerald-400 text-2xl mb-2 block"></i>
+                            All queues running smoothly.
                         </div>
-                        <div class="group flex gap-3 p-3 rounded-xl bg-gradient-to-r from-blue-50 to-transparent hover:from-blue-100 transition-all duration-300 cursor-pointer">
-                            <div class="w-8 h-8 rounded-full bg-blue-200 flex items-center justify-center">
-                                <i class="fas fa-users text-blue-700 text-xs"></i>
+                        <?php else: ?>
+                        <?php
+                        $alertStyleMap = [
+                            'amber'   => ['from-amber-50','bg-amber-200','text-amber-700','text-amber-800','text-amber-600'],
+                            'blue'    => ['from-blue-50','bg-blue-200','text-blue-700','text-blue-800','text-blue-600'],
+                            'green'   => ['from-emerald-50','bg-emerald-200','text-emerald-700','text-emerald-800','text-emerald-600'],
+                        ];
+                        foreach ($liveAlerts as $alert):
+                            $s = $alertStyleMap[$alert['color']] ?? $alertStyleMap['blue'];
+                        ?>
+                        <div class="group flex gap-3 p-3 rounded-xl bg-gradient-to-r <?php echo $s[0]; ?> to-transparent hover:opacity-90 transition-all duration-300 cursor-pointer">
+                            <div class="w-8 h-8 rounded-full <?php echo $s[1]; ?> flex items-center justify-center flex-shrink-0">
+                                <i class="fas <?php echo htmlspecialchars($alert['icon']); ?> <?php echo $s[2]; ?> text-xs"></i>
                             </div>
-                            <div class="flex-1">
-                                <div class="text-sm font-semibold text-blue-800">Staff shortage</div>
-                                <div class="text-xs text-blue-600">Medical wing needs additional staff</div>
+                            <div class="flex-1 min-w-0">
+                                <div class="text-sm font-semibold <?php echo $s[3]; ?> truncate"><?php echo htmlspecialchars($alert['message']); ?></div>
+                                <div class="text-xs <?php echo $s[4]; ?>">Updated just now</div>
                             </div>
-                            <span class="text-xs text-blue-400">15 min ago</span>
                         </div>
-                        <div class="group flex gap-3 p-3 rounded-xl bg-gradient-to-r from-emerald-50 to-transparent hover:from-emerald-100 transition-all duration-300 cursor-pointer">
-                            <div class="w-8 h-8 rounded-full bg-emerald-200 flex items-center justify-center">
-                                <i class="fas fa-check-circle text-emerald-700 text-xs"></i>
-                            </div>
-                            <div class="flex-1">
-                                <div class="text-sm font-semibold text-emerald-800">System updated</div>
-                                <div class="text-xs text-emerald-600">Queue system v2.1 installed</div>
-                            </div>
-                            <span class="text-xs text-emerald-400">1 hour ago</span>
-                        </div>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>

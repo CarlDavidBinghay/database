@@ -22,6 +22,38 @@ $db = new mysqli('localhost', 'root', '', 'aquaqueue_db');
 if ($db->connect_error) die('DB error: ' . $db->connect_error);
 $db->set_charset('utf8mb4');
 
+// ── Queue log helper ──────────────────────────────────────────
+function writeQueueLog(
+    mysqli $db,
+    int    $aptId,
+    string $queueNo,
+    string $action,
+    int    $performedBy,
+    string $performedByName,
+    ?int   $serviceId    = null,
+    string $serviceName  = '',
+    string $customerName = '',
+    string $customerPhone= '',
+    string $cancelReason = '',
+    string $notes        = ''
+): void {
+    $stmt = $db->prepare(
+        'INSERT INTO queue_logs
+         (appointment_id, queue_number, service_id, service_name,
+          customer_name, customer_phone, action,
+          performed_by, performed_by_name, cancel_reason, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+    $stmt->bind_param(
+        'ississsisss',
+        $aptId, $queueNo, $serviceId, $serviceName,
+        $customerName, $customerPhone, $action,
+        $performedBy, $performedByName, $cancelReason, $notes
+    );
+    $stmt->execute();
+    $stmt->close();
+}
+
 // ── Determine which service(s) this user may see ─────────────
 if ($isServiceAdmin) {
     // Pull the assigned service(s) from service_admin_assignments
@@ -136,11 +168,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
 
             if ($insApt->execute()) {
+                $newAptId = $db->insert_id;
                 // Update counter
                 $upd = $db->prepare('UPDATE queue_status SET last_issued = ? WHERE id = ?');
                 $upd->bind_param('ii', $newNum, $qsId);
                 $upd->execute();
                 $upd->close();
+
+                // Get service name for log
+                $svcNameRes = $db->query("SELECT name FROM booking_services WHERE id = $svcId LIMIT 1");
+                $svcNameLog = $svcNameRes ? ($svcNameRes->fetch_assoc()['name'] ?? '') : '';
+
+                writeQueueLog(
+                    $db, $newAptId, $queueNo,
+                    'added',
+                    $sessionUserId,
+                    $_SESSION['user_name'] ?? 'Staff',
+                    $svcId, $svcNameLog,
+                    $custName, $custPhone,
+                    '', $notes
+                );
+
                 $msg = "Added <strong>{$custName}</strong> to queue as <strong>{$queueNo}</strong>.";
                 $msgType = 'success';
             } else {
@@ -241,6 +289,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $upd->bind_param('si', $reason, $aptId);
             $upd->execute();
             $upd->close();
+
+            // Log the cancellation
+            $logStmt = $db->prepare(
+                "SELECT a.queue_number,
+                        COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS cname,
+                        COALESCE(NULLIF(TRIM(a.guest_phone),''), u.phone) AS cphone,
+                        bs.name AS svc_name
+                 FROM appointments a
+                 LEFT JOIN users u  ON u.id  = a.user_id
+                 LEFT JOIN booking_services bs ON bs.id = a.service_id
+                 WHERE a.id = ? LIMIT 1"
+            );
+            $logStmt->bind_param('i', $aptId);
+            $logStmt->execute();
+            $logRow = $logStmt->get_result()->fetch_assoc();
+            $logStmt->close();
+
+            writeQueueLog(
+                $db, $aptId,
+                $logRow['queue_number'] ?? '',
+                'cancelled',
+                $sessionUserId,
+                $_SESSION['user_name'] ?? 'Staff',
+                (int)$aptRow['service_id'],
+                $logRow['svc_name']  ?? '',
+                $logRow['cname']     ?? '',
+                $logRow['cphone']    ?? '',
+                $reason
+            );
+
             $msg = 'Appointment cancelled.'; $msgType = 'success';
         }
     }
@@ -257,11 +335,146 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$aptRow || !isAllowedService((int)$aptRow['service_id'], $allowedServiceIds)) {
             $msg = 'Not authorised.'; $msgType = 'error';
         } else {
-            $upd = $db->prepare("UPDATE appointments SET status='no_show' WHERE id=?");
+            $upd = $db->prepare("UPDATE appointments SET status='no_show', cancelled_at=NOW() WHERE id=?");
             $upd->bind_param('i', $aptId);
             $upd->execute();
             $upd->close();
+
+            $logStmt = $db->prepare(
+                "SELECT a.queue_number,
+                        COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS cname,
+                        COALESCE(NULLIF(TRIM(a.guest_phone),''), u.phone) AS cphone,
+                        bs.name AS svc_name
+                 FROM appointments a
+                 LEFT JOIN users u  ON u.id  = a.user_id
+                 LEFT JOIN booking_services bs ON bs.id = a.service_id
+                 WHERE a.id = ? LIMIT 1"
+            );
+            $logStmt->bind_param('i', $aptId);
+            $logStmt->execute();
+            $logRow = $logStmt->get_result()->fetch_assoc();
+            $logStmt->close();
+
+            writeQueueLog(
+                $db, $aptId,
+                $logRow['queue_number'] ?? '',
+                'no_show',
+                $sessionUserId,
+                $_SESSION['user_name'] ?? 'Staff',
+                (int)$aptRow['service_id'],
+                $logRow['svc_name'] ?? '',
+                $logRow['cname']    ?? '',
+                $logRow['cphone']   ?? ''
+            );
+
             $msg = 'Marked as no-show.'; $msgType = 'info';
+        }
+    }
+
+    // ── CONFIRM / ACCEPT APPOINTMENT ──────────────────────────
+    if ($action === 'confirm_apt') {
+        $aptId = (int)($_POST['apt_id'] ?? 0);
+        $chk   = $db->prepare('SELECT service_id FROM appointments WHERE id=? LIMIT 1');
+        $chk->bind_param('i', $aptId);
+        $chk->execute();
+        $aptRow = $chk->get_result()->fetch_assoc();
+        $chk->close();
+
+        if (!$aptRow || !isAllowedService((int)$aptRow['service_id'], $allowedServiceIds)) {
+            $msg = 'Not authorised to confirm that appointment.'; $msgType = 'error';
+        } else {
+            $upd = $db->prepare(
+                "UPDATE appointments SET status='in_queue', confirmed_at=NOW() WHERE id=? AND status IN ('pending','confirmed')"
+            );
+            $upd->bind_param('i', $aptId);
+            $upd->execute();
+            $affectedRows = $upd->affected_rows;
+            $upd->close();
+
+            if ($affectedRows > 0) {
+                // Fetch extra details for the log
+                $logStmt = $db->prepare(
+                    "SELECT a.queue_number,
+                            COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS cname,
+                            COALESCE(NULLIF(TRIM(a.guest_phone),''), u.phone) AS cphone,
+                            bs.name AS svc_name
+                     FROM appointments a
+                     LEFT JOIN users u  ON u.id  = a.user_id
+                     LEFT JOIN booking_services bs ON bs.id = a.service_id
+                     WHERE a.id = ? LIMIT 1"
+                );
+                $logStmt->bind_param('i', $aptId);
+                $logStmt->execute();
+                $logRow = $logStmt->get_result()->fetch_assoc();
+                $logStmt->close();
+
+                writeQueueLog(
+                    $db, $aptId,
+                    $logRow['queue_number'] ?? '',
+                    'accepted',
+                    $sessionUserId,
+                    $_SESSION['user_name'] ?? 'Staff',
+                    (int)$aptRow['service_id'],
+                    $logRow['svc_name']  ?? '',
+                    $logRow['cname']     ?? '',
+                    $logRow['cphone']    ?? ''
+                );
+            }
+
+            $msg = 'Appointment accepted and added to queue.'; $msgType = 'success';
+        }
+    }
+
+    // ── MARK COMPLETED ─────────────────────────────────────────
+    if ($action === 'complete_apt') {
+        $aptId = (int)($_POST['apt_id'] ?? 0);
+        $chk   = $db->prepare('SELECT service_id FROM appointments WHERE id=? LIMIT 1');
+        $chk->bind_param('i', $aptId);
+        $chk->execute();
+        $aptRow = $chk->get_result()->fetch_assoc();
+        $chk->close();
+
+        if (!$aptRow || !isAllowedService((int)$aptRow['service_id'], $allowedServiceIds)) {
+            $msg = 'Not authorised.'; $msgType = 'error';
+        } else {
+            $upd = $db->prepare(
+                "UPDATE appointments SET status='completed', completed_at=NOW() WHERE id=? AND status='serving'"
+            );
+            $upd->bind_param('i', $aptId);
+            $upd->execute();
+            $affected = $upd->affected_rows;
+            $upd->close();
+
+            if ($affected > 0) {
+                $logStmt = $db->prepare(
+                    "SELECT a.queue_number,
+                            COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS cname,
+                            COALESCE(NULLIF(TRIM(a.guest_phone),''), u.phone) AS cphone,
+                            bs.name AS svc_name
+                     FROM appointments a
+                     LEFT JOIN users u  ON u.id  = a.user_id
+                     LEFT JOIN booking_services bs ON bs.id = a.service_id
+                     WHERE a.id = ? LIMIT 1"
+                );
+                $logStmt->bind_param('i', $aptId);
+                $logStmt->execute();
+                $logRow = $logStmt->get_result()->fetch_assoc();
+                $logStmt->close();
+
+                writeQueueLog(
+                    $db, $aptId,
+                    $logRow['queue_number'] ?? '',
+                    'completed',
+                    $sessionUserId,
+                    $_SESSION['user_name'] ?? 'Staff',
+                    (int)$aptRow['service_id'],
+                    $logRow['svc_name'] ?? '',
+                    $logRow['cname']    ?? '',
+                    $logRow['cphone']   ?? ''
+                );
+            }
+
+            $msg = 'Appointment marked as completed.'; $msgType = 'success';
         }
     }
 
@@ -340,22 +553,25 @@ foreach ($assignedServices as $svc) {
         $qsData[$locId] = $row;
     }
 
-    // Live appointments for today (in_queue + serving)
+    // Live appointments: today's queue (in_queue/serving) + all pending/confirmed bookings (any date)
     if (!empty($locations)) {
         $aptStmt = $db->prepare(
             "SELECT a.id, a.queue_number,
-                    COALESCE(a.guest_name, CONCAT(u.first_name,' ',u.last_name)) AS guest_name,
-                    COALESCE(a.guest_phone, u.phone) AS guest_phone,
-                    a.status, a.priority, a.notes, a.appointment_time
+                    COALESCE(NULLIF(TRIM(a.guest_name),''), CONCAT(u.first_name,' ',u.last_name)) AS guest_name,
+                    COALESCE(NULLIF(TRIM(a.guest_phone),''), u.phone) AS guest_phone,
+                    a.status, a.priority, a.notes, a.appointment_date, a.appointment_time
              FROM appointments a
              LEFT JOIN users u ON u.id = a.user_id
-             WHERE a.service_id=?
-               AND a.appointment_date=CURDATE()
-               AND a.status IN ('in_queue','serving','pending','confirmed')
+             WHERE a.service_id = ?
+               AND (
+                   (a.status IN ('in_queue','serving') AND a.appointment_date = CURDATE())
+                   OR a.status IN ('pending','confirmed')
+               )
              ORDER BY
-               CASE a.status WHEN 'serving' THEN 0 ELSE 1 END,
+               CASE a.status WHEN 'serving' THEN 0 WHEN 'in_queue' THEN 1
+                             WHEN 'confirmed' THEN 2 ELSE 3 END,
                CASE a.priority WHEN 'vip' THEN 1 WHEN 'express' THEN 2 ELSE 3 END,
-               a.id ASC"
+               a.appointment_date ASC, a.id ASC"
         );
         $aptStmt->bind_param('i', $svcId);
         $aptStmt->execute();
@@ -372,20 +588,17 @@ foreach ($assignedServices as $svc) {
     ]);
 }
 
-// ── Recent completed (last 20, across allowed services) ──────
+// ── Recent activity log (last 30, across allowed services) ──
 if (!empty($allowedServiceIds)) {
     $ph2  = implode(',', array_fill(0, count($allowedServiceIds), '?'));
     $recStmt = $db->prepare(
-        "SELECT a.id, a.queue_number, a.guest_name, a.status,
-                a.appointment_time, a.completed_at, a.cancelled_at,
-                bs.name AS service_name
-         FROM appointments a
-         JOIN booking_services bs ON bs.id = a.service_id
-         WHERE a.service_id IN ($ph2)
-           AND a.appointment_date = CURDATE()
-           AND a.status IN ('completed','cancelled','no_show')
-         ORDER BY COALESCE(a.completed_at, a.cancelled_at) DESC
-         LIMIT 20"
+        "SELECT ql.queue_number, ql.customer_name, ql.service_name,
+                ql.action, ql.performed_by_name, ql.cancel_reason, ql.created_at
+         FROM queue_logs ql
+         WHERE ql.service_id IN ($ph2)
+           AND DATE(ql.created_at) = CURDATE()
+         ORDER BY ql.created_at DESC
+         LIMIT 30"
     );
     $recStmt->bind_param(str_repeat('i', count($allowedServiceIds)), ...$allowedServiceIds);
     $recStmt->execute();
@@ -604,7 +817,7 @@ include('../includes/header.php');
                 <table class="min-w-full divide-y divide-gray-50">
                     <thead class="bg-gray-50">
                         <tr>
-                            <?php foreach (['#','Queue No.','Customer','Service','Priority','Status','Time','Actions'] as $h): ?>
+                            <?php foreach (['#','Queue No.','Customer','Service','Priority','Status','Date','Time','Actions'] as $h): ?>
                             <th class="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap"><?php echo $h; ?></th>
                             <?php endforeach; ?>
                         </tr>
@@ -636,35 +849,71 @@ include('../includes/header.php');
                             </span>
                         </td>
                         <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
+                            <?php
+                            $apDate  = $apt['appointment_date'] ?? '';
+                            $isToday = ($apDate === date('Y-m-d'));
+                            echo $isToday
+                                ? '<span class="text-green-600 font-semibold">Today</span>'
+                                : htmlspecialchars(date('M j, Y', strtotime($apDate)));
+                            ?>
+                        </td>
+                        <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
                             <?php echo substr($apt['appointment_time'], 0, 5); ?>
                         </td>
                         <td class="px-4 py-3">
                             <?php if ($canQueue): ?>
-                            <div class="flex items-center gap-2">
-                                <?php if ($apt['status'] === 'in_queue'): ?>
-                                <!-- Start serving -->
-                                <form method="POST" class="inline">
-                                    <input type="hidden" name="action"      value="next_queue">
-                                    <input type="hidden" name="location_id" value="<?php echo $locId; ?>">
-                                    <input type="hidden" name="service_id"  value="<?php echo $svcId; ?>">
-                                    <button type="submit" class="text-green-500 hover:text-green-700 text-sm" title="Call / Serve">
-                                        <i class="fas fa-play-circle"></i>
+                            <div class="flex items-center gap-1.5 flex-wrap">
+                                <?php if (in_array($apt['status'], ['pending','confirmed'])): ?>
+                                <form method="POST" class="inline"
+                                      onsubmit="return confirm('Accept this booking and add to queue?')">
+                                    <input type="hidden" name="action" value="confirm_apt">
+                                    <input type="hidden" name="apt_id" value="<?php echo $apt['id']; ?>">
+                                    <button type="submit"
+                                        class="inline-flex items-center gap-1 px-2.5 py-1 bg-green-100 text-green-700 hover:bg-green-200 rounded-lg text-xs font-bold transition-all"
+                                        title="Accept & Add to Queue">
+                                        <i class="fas fa-check"></i> Accept
                                     </button>
                                 </form>
                                 <?php endif; ?>
-                                <!-- No-show -->
-                                <form method="POST" class="inline">
+                                <?php if ($apt['status'] === 'in_queue'): ?>
+                                <form method="POST" class="inline"
+                                      onsubmit="return confirm('Call this customer and start serving?')">
+                                    <input type="hidden" name="action"      value="next_queue">
+                                    <input type="hidden" name="location_id" value="<?php echo $locId; ?>">
+                                    <input type="hidden" name="service_id"  value="<?php echo $svcId; ?>">
+                                    <button type="submit"
+                                        class="inline-flex items-center gap-1 px-2.5 py-1 bg-blue-100 text-blue-700 hover:bg-blue-200 rounded-lg text-xs font-bold transition-all"
+                                        title="Call / Serve">
+                                        <i class="fas fa-play"></i> Serve
+                                    </button>
+                                </form>
+                                <?php endif; ?>
+                                <?php if ($apt['status'] === 'serving'): ?>
+                                <form method="POST" class="inline"
+                                      onsubmit="return confirm('Mark this appointment as completed?')">
+                                    <input type="hidden" name="action" value="complete_apt">
+                                    <input type="hidden" name="apt_id" value="<?php echo $apt['id']; ?>">
+                                    <button type="submit"
+                                        class="inline-flex items-center gap-1 px-2.5 py-1 bg-teal-100 text-teal-700 hover:bg-teal-200 rounded-lg text-xs font-bold transition-all"
+                                        title="Mark Done">
+                                        <i class="fas fa-check-double"></i> Done
+                                    </button>
+                                </form>
+                                <?php endif; ?>
+                                <form method="POST" class="inline"
+                                      onsubmit="return confirm('Mark as no-show?')">
                                     <input type="hidden" name="action" value="mark_noshow">
                                     <input type="hidden" name="apt_id" value="<?php echo $apt['id']; ?>">
-                                    <button type="submit" class="text-yellow-500 hover:text-yellow-700 text-sm" title="Mark No-Show"
-                                        onclick="return confirm('Mark as no-show?')">
+                                    <button type="submit"
+                                        class="inline-flex items-center gap-1 px-2.5 py-1 bg-yellow-50 text-yellow-700 hover:bg-yellow-100 rounded-lg text-xs font-bold transition-all"
+                                        title="No-Show">
                                         <i class="fas fa-user-slash"></i>
                                     </button>
                                 </form>
-                                <!-- Cancel -->
-                                <button onclick="openCancelModal(<?php echo $apt['id']; ?>, '<?php echo addslashes($apt['guest_name']); ?>')"
-                                    class="text-red-400 hover:text-red-600 text-sm" title="Cancel">
-                                    <i class="fas fa-times-circle"></i>
+                                <button onclick="openCancelModal(<?php echo $apt['id']; ?>, '<?php echo addslashes($apt['guest_name'] ?? ''); ?>')"
+                                    class="inline-flex items-center gap-1 px-2.5 py-1 bg-red-50 text-red-500 hover:bg-red-100 rounded-lg text-xs font-bold transition-all"
+                                    title="Cancel">
+                                    <i class="fas fa-times"></i>
                                 </button>
                             </div>
                             <?php endif; ?>
@@ -745,37 +994,59 @@ include('../includes/header.php');
     </div><!-- end service block -->
     <?php endforeach; ?>
 
-    <!-- ── RECENT COMPLETIONS ──────────────────────────────────── -->
+    <!-- ── ACTIVITY LOG ──────────────────────────────────────── -->
     <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-6 mb-8">
-        <h2 class="text-xl font-semibold text-gray-900 mb-5">Today's Completed / Cancelled</h2>
+        <h2 class="text-xl font-semibold text-gray-900 mb-5">Today's Activity Log</h2>
         <?php if (empty($recentDone)): ?>
         <div class="text-center text-gray-400 py-8">
-            <i class="fas fa-clipboard-check text-3xl opacity-30 mb-2 block"></i>No completions yet today.
+            <i class="fas fa-clipboard-list text-3xl opacity-30 mb-2 block"></i>No activity yet today.
         </div>
         <?php else: ?>
         <div class="overflow-x-auto">
             <table class="min-w-full divide-y divide-gray-50">
                 <thead class="bg-gray-50">
                     <tr>
-                        <?php foreach (['Queue No.','Customer','Service','Status','Time'] as $h): ?>
-                        <th class="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider"><?php echo $h; ?></th>
+                        <?php foreach (['Time','Queue No.','Customer','Service','Action','Staff','Note'] as $h): ?>
+                        <th class="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap"><?php echo $h; ?></th>
                         <?php endforeach; ?>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-50">
-                <?php foreach ($recentDone as $r): ?>
-                <tr class="hover:bg-gray-50">
-                    <td class="px-4 py-3 font-bold text-sm text-gray-800"><?php echo htmlspecialchars($r['queue_number']); ?></td>
-                    <td class="px-4 py-3 text-sm text-gray-700"><?php echo htmlspecialchars($r['guest_name'] ?? '—'); ?></td>
-                    <td class="px-4 py-3 text-sm text-gray-600"><?php echo htmlspecialchars($r['service_name']); ?></td>
-                    <td class="px-4 py-3">
-                        <span class="status-badge badge-<?php echo $r['status']; ?>">
-                            <?php echo str_replace('_',' ', ucfirst($r['status'])); ?>
+                <?php
+                $actionBadge = [
+                    'accepted'  => ['bg-green-100 text-green-700',  'fa-check-circle',  'Accepted'],
+                    'cancelled' => ['bg-red-100 text-red-600',       'fa-times-circle',  'Cancelled'],
+                    'completed' => ['bg-teal-100 text-teal-700',     'fa-check-double',  'Completed'],
+                    'no_show'   => ['bg-yellow-100 text-yellow-700', 'fa-user-slash',    'No-Show'],
+                    'added'     => ['bg-blue-100 text-blue-600',     'fa-plus-circle',   'Added'],
+                    'served'    => ['bg-purple-100 text-purple-700', 'fa-play-circle',   'Served'],
+                ];
+                foreach ($recentDone as $r):
+                    $ab = $actionBadge[$r['action']] ?? ['bg-gray-100 text-gray-600', 'fa-circle', ucfirst($r['action'])];
+                ?>
+                <tr class="hover:bg-gray-50 transition-colors">
+                    <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
+                        <?php echo date('H:i', strtotime($r['created_at'])); ?>
+                    </td>
+                    <td class="px-4 py-3 font-bold text-sm text-gray-800 whitespace-nowrap">
+                        <?php echo htmlspecialchars($r['queue_number'] ?: '—'); ?>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-700">
+                        <?php echo htmlspecialchars($r['customer_name'] ?? '—'); ?>
+                    </td>
+                    <td class="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">
+                        <?php echo htmlspecialchars($r['service_name'] ?? '—'); ?>
+                    </td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                        <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold <?php echo $ab[0]; ?>">
+                            <i class="fas <?php echo $ab[1]; ?>"></i><?php echo $ab[2]; ?>
                         </span>
                     </td>
-                    <td class="px-4 py-3 text-sm text-gray-500">
-                        <?php echo $r['completed_at'] ? date('H:i', strtotime($r['completed_at']))
-                                : ($r['cancelled_at'] ? date('H:i', strtotime($r['cancelled_at'])) : '—'); ?>
+                    <td class="px-4 py-3 text-sm text-gray-500 whitespace-nowrap">
+                        <?php echo htmlspecialchars($r['performed_by_name'] ?? '—'); ?>
+                    </td>
+                    <td class="px-4 py-3 text-xs text-gray-400 max-w-[140px] truncate" title="<?php echo htmlspecialchars($r['cancel_reason'] ?? ''); ?>">
+                        <?php echo htmlspecialchars($r['cancel_reason'] ?: ''); ?>
                     </td>
                 </tr>
                 <?php endforeach; ?>

@@ -32,8 +32,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'book_
     if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Valid email is required.';
 
     if (empty($errors)) {
-        // Get the service id and prefix from slug
-        $svcStmt = $db->prepare('SELECT id, prefix FROM booking_services WHERE slug = ? AND is_active = 1 LIMIT 1');
+        // Get the service id — use UPPER(SUBSTR(slug,1,1)) as prefix since there is no prefix column
+        $svcStmt = $db->prepare('SELECT id, UPPER(SUBSTR(slug,1,1)) AS prefix FROM booking_services WHERE slug = ? AND is_active = 1 LIMIT 1');
         $svcStmt->bind_param('s', $serviceSlug);
         $svcStmt->execute();
         $svcRow = $svcStmt->get_result()->fetch_assoc();
@@ -43,9 +43,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'book_
             $errors[] = 'Invalid service selected.';
         } else {
             $svcId  = $svcRow['id'];
-            $prefix = strtoupper($svcRow['prefix'] ?? substr($serviceSlug, 0, 1));
+            $prefix = $svcRow['prefix'] ?: strtoupper(substr($serviceSlug, 0, 1));
 
-            // Get or create queue_status row for today + location
+            // Get or create queue_status row for the booking date + location
             $qs = $db->prepare('SELECT id, last_issued FROM queue_status WHERE location_id = ? AND queue_date = ?');
             $qs->bind_param('is', $locationId, $aptDate);
             $qs->execute();
@@ -53,7 +53,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'book_
             $qs->close();
 
             if (!$qsRow) {
-                $ins = $db->prepare('INSERT INTO queue_status (location_id, queue_date, counter_prefix, last_issued, is_open) VALUES (?, ?, ?, 0, 1)');
+                $ins = $db->prepare('INSERT IGNORE INTO queue_status (location_id, queue_date, counter_prefix, last_issued, is_open) VALUES (?, ?, ?, 0, 1)');
                 $ins->bind_param('iss', $locationId, $aptDate, $prefix);
                 $ins->execute();
                 $qsId       = $db->insert_id;
@@ -64,18 +64,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'book_
                 $lastIssued = (int)$qsRow['last_issued'];
             }
 
-            $newNum   = $lastIssued + 1;
-            $queueNo  = sprintf('%s-%03d', $prefix, $newNum);
-            $guestName  = $firstName . ' ' . $lastName;
+            $newNum     = $lastIssued + 1;
+            $queueNo    = sprintf('%s-%03d', $prefix, $newNum);
+            $guestName  = trim($firstName . ' ' . $lastName);
             $totalPrice = $basePrice + $surcharge;
 
-            // Insert appointment
+            // Insert appointment — includes location_id (NOT NULL in schema)
             $insApt = $db->prepare(
                 'INSERT INTO appointments
                  (user_id, service_id, location_id, queue_number, appointment_date,
                   appointment_time, priority, base_price, notes,
                   guest_name, guest_email, guest_phone, status, confirmed_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "confirmed", NOW())'
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "pending", NOW())'
             );
             $insApt->bind_param(
                 'iiissssdssss',
@@ -694,11 +694,24 @@ function renderStars(float $r): string {
                 </button>
             </div>
 
+            <?php
+            // Build a map of slug → [location_ids] in ONE query, reused for all cards
+            $locLookup = new mysqli('localhost','root','','aquaqueue_db');
+            $locLookup->set_charset('utf8mb4');
+            $locIdMap = [];
+            $locRes2 = $locLookup->query('SELECT sl.id, bs.slug FROM service_locations sl JOIN booking_services bs ON bs.id=sl.service_id WHERE sl.is_active=1 ORDER BY bs.slug, sl.id ASC');
+            if ($locRes2) { while ($lr = $locRes2->fetch_assoc()) { $locIdMap[$lr['slug']][] = $lr['id']; } }
+            $locLookup->close();
+            ?>
+
             <?php foreach ($locationData as $svcKey => $places): ?>
             <div id="<?= $svcKey ?>-locations" class="locations-container hidden">
                 <div class="grid md:grid-cols-2 gap-5">
                     <?php foreach ($places as $idx => $p): ?>
-                    <?php $uid = $svcKey . '_' . $idx; ?>
+                    <?php
+                    $uid     = $svcKey . '_' . $idx;
+                    $locDbId = (int)($locIdMap[$svcKey][$idx] ?? 0);
+                    ?>
 
                     <!-- Location Card -->
                     <div class="location-card border-2 border-gray-200 rounded-xl p-5 hover:border-[#71C9CE] hover:bg-[#E3FDFD] transition-all">
@@ -733,17 +746,8 @@ function renderStars(float $r): string {
                                     onclick="openEmail('<?= htmlspecialchars(addslashes($p['name'])) ?>', '<?= $svcKey ?>')">
                                 <i class="fas fa-envelope"></i> Email
                             </button>
-                            <?php
-                            // Look up DB location_id for this specific location
-                            $locDbId = 0;
-                            $locLookup = (new mysqli('localhost','root','','aquaqueue_db'));
-                            $locLookup->set_charset('utf8mb4');
-                            $locQ = $locLookup->prepare('SELECT sl.id FROM service_locations sl JOIN booking_services bs ON bs.id=sl.service_id WHERE bs.slug=? AND sl.is_active=1 ORDER BY sl.id ASC LIMIT 1 OFFSET ?');
-                            if ($locQ) { $locQ->bind_param('si', $svcKey, $idx); $locQ->execute(); $locQ->bind_result($locDbId); $locQ->fetch(); $locQ->close(); }
-                            $locLookup->close();
-                            ?>
                             <button class="btn-info btn-book"
-                                    onclick="selectLocation('<?= $svcKey ?>', '<?= htmlspecialchars(addslashes($p['name'])) ?>', <?= $p['price'] ?>, <?= $p['duration'] ?>, <?= (int)$locDbId ?>)">
+                                    onclick="selectLocation('<?= $svcKey ?>', '<?= htmlspecialchars(addslashes($p['name'])) ?>', <?= $p['price'] ?>, <?= $p['duration'] ?>, <?= $locDbId ?>)">
                                 <i class="fas fa-calendar-check"></i> Book
                             </button>
                         </div>
@@ -793,7 +797,7 @@ function renderStars(float $r): string {
                                             class="flex-1 py-2.5 px-4 bg-[#71C9CE] text-white font-semibold rounded-xl hover:bg-[#5ab4b9] transition-all text-sm">
                                         <i class="fas fa-envelope mr-2"></i>Send Email
                                     </button>
-                                    <button onclick="closeModal('modal-<?= $uid ?>'); selectLocation('<?= $svcKey ?>','<?= htmlspecialchars(addslashes($p['name'])) ?>',<?= $p['price'] ?>,<?= $p['duration'] ?>)"
+                                    <button onclick="closeModal('modal-<?= $uid ?>'); selectLocation('<?= $svcKey ?>','<?= htmlspecialchars(addslashes($p['name'])) ?>',<?= $p['price'] ?>,<?= $p['duration'] ?>,<?= $locDbId ?>)"
                                             class="flex-1 py-2.5 px-4 bg-[#E3FDFD] text-[#3aabb1] font-semibold border-2 border-[#A6E3E9] rounded-xl hover:bg-[#cbf5f7] transition-all text-sm">
                                         <i class="fas fa-calendar-check mr-2"></i>Book Now
                                     </button>
@@ -1074,16 +1078,8 @@ let prioritySurcharge  = 0;
 
 const IS_LOGGED_IN = <?= isset($_SESSION['user_id']) ? 'true' : 'false' ?>;
 
-// DB location IDs per service (populated from PHP/DB)
-const LOCATION_IDS = <?php
-    $db2 = new mysqli('localhost','root','','aquaqueue_db');
-    $db2->set_charset('utf8mb4');
-    $map = [];
-    $res = $db2->query('SELECT sl.id, bs.slug FROM service_locations sl JOIN booking_services bs ON bs.id=sl.service_id WHERE sl.is_active=1 ORDER BY bs.slug, sl.id ASC');
-    if ($res) { while ($r = $res->fetch_assoc()) { $map[$r['slug']][] = $r['id']; } }
-    $db2->close();
-    echo json_encode($map);
-?>;
+// DB location IDs per service (populated from PHP)
+const LOCATION_IDS = <?= json_encode($locIdMap) ?>;
 
 let calYear  = new Date().getFullYear();
 let calMonth = new Date().getMonth();

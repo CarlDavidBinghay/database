@@ -242,7 +242,7 @@ h1, h2, h3, h4 { font-family: 'Sora', sans-serif; }
             </p>
         </div>
 
-        <div class="grid md:grid-cols-2 gap-8 max-w-3xl mx-auto">
+        <div class="grid md:grid-cols-3 gap-8 max-w-1xl mx-auto">
 
             <!-- Carl -->
             <div class="glass rounded-2xl p-8 text-center reveal-left">
@@ -281,6 +281,98 @@ h1, h2, h3, h4 { font-family: 'Sora', sans-serif; }
                 </p>
                 <div class="flex justify-center gap-2">
                     <a href="mailto:t.gil0409@gmail.com" class="social-btn" title="Email"><i class="fas fa-envelope"></i></a>
+                    <a href="#" class="social-btn" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                    <a href="#" class="social-btn" title="GitHub"><i class="fab fa-github"></i></a>
+                </div>
+            </div>
+
+            <!-- Labiaga -->
+            <div class="glass rounded-2xl p-8 text-center reveal-right">
+                <img src="../assets/js/labiaga.png"
+                     alt="Roshele Faye Labiaga"
+                     class="team-photo mx-auto mb-5"
+                     onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+                <div class="w-36 h-36 rounded-full mx-auto mb-5 items-center justify-center text-4xl font-bold text-white hidden"
+                     style="background:linear-gradient(135deg,#71C9CE,#4db8be)">R</div>
+                <h3 class="text-xl font-bold text-[#0d1117]">Roshele Faye Labiaga</h3>
+                <p class="text-[#71C9CE] font-semibold text-sm mt-1 mb-3">Project Manager</p>
+                <p class="text-[#6b7a8d] text-sm leading-relaxed mb-5">
+                    Roshele serves as the Project Manager of AquaQueue, overseeing the development process, coordinating the team, and 
+                    ensuring that all project goals, timelines, and system requirements are successfully achieved.
+
+
+                </p>
+                <div class="flex justify-center gap-2">
+                    <a href="mailto:roshele.labiaga@gmail.com" class="social-btn" title="Email"><i class="fas fa-envelope"></i></a>
+                    <a href="#" class="social-btn" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                    <a href="#" class="social-btn" title="GitHub"><i class="fab fa-github"></i></a>
+                </div>
+            </div>
+
+            <!-- Paradilla -->
+            <div class="glass rounded-2xl p-8 text-center reveal-right">
+                <img src="../assets/js/paradilla.png"
+                     alt="Joseph Paradilla"
+                     class="team-photo mx-auto mb-5"
+                     onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+                <div class="w-36 h-36 rounded-full mx-auto mb-5 items-center justify-center text-4xl font-bold text-white hidden"
+                     style="background:linear-gradient(135deg,#71C9CE,#4db8be)">J</div>
+                <h3 class="text-xl font-bold text-[#0d1117]">Joseph Paradilla</h3>
+                <p class="text-[#71C9CE] font-semibold text-sm mt-1 mb-3">Tester</p>
+                <p class="text-[#6b7a8d] text-sm leading-relaxed mb-5">
+                    Joseph serves as the System Tester of AquaQueue, conducting thorough testing to identify bugs, verify system functionality, 
+                    and ensure a smooth and reliable user experience.
+
+
+                </p>
+                <div class="flex justify-center gap-2">
+                    <a href="mailto:joseph.paradilla@gmail.com" class="social-btn" title="Email"><i class="fas fa-envelope"></i></a>
+                    <a href="#" class="social-btn" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                    <a href="#" class="social-btn" title="GitHub"><i class="fab fa-github"></i></a>
+                </div>
+            </div>
+
+            <!-- Bumanglag -->
+            <div class="glass rounded-2xl p-8 text-center reveal-right">
+                <img src="../assets/js/bumanglag.png"
+                     alt="Rhenz Yvan Bumanglag"
+                     class="team-photo mx-auto mb-5"
+                     onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+                <div class="w-36 h-36 rounded-full mx-auto mb-5 items-center justify-center text-4xl font-bold text-white hidden"
+                     style="background:linear-gradient(135deg,#71C9CE,#4db8be)">R</div>
+                <h3 class="text-xl font-bold text-[#0d1117]">Rhenz Yvan Bumanglag</h3>
+                <p class="text-[#71C9CE] font-semibold text-sm mt-1 mb-3">Programmer</p>
+                <p class="text-[#6b7a8d] text-sm leading-relaxed mb-5">
+                    Rhenz serves as the Programmer of AquaQueue, developing and implementing system features to 
+                    ensure smooth functionality, efficiency, and reliable performance.
+
+
+                </p>
+                <div class="flex justify-center gap-2">
+                    <a href="mailto:rhenz.bumanglag@gmail.com" class="social-btn" title="Email"><i class="fas fa-envelope"></i></a>
+                    <a href="#" class="social-btn" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+                    <a href="#" class="social-btn" title="GitHub"><i class="fab fa-github"></i></a>
+                </div>
+            </div>
+
+            <!-- Metante -->
+            <div class="glass rounded-2xl p-8 text-center reveal-right">
+                <img src="../assets/js/metante.png"
+                     alt="Jastine A. Metante"
+                     class="team-photo mx-auto mb-5"
+                     onerror="this.style.display='none'; this.nextElementSibling.style.display='flex'">
+                <div class="w-36 h-36 rounded-full mx-auto mb-5 items-center justify-center text-4xl font-bold text-white hidden"
+                     style="background:linear-gradient(135deg,#71C9CE,#4db8be)">J</div>
+                <h3 class="text-xl font-bold text-[#0d1117]">Jastine A. Metante</h3>
+                <p class="text-[#71C9CE] font-semibold text-sm mt-1 mb-3">Tester</p>
+                <p class="text-[#6b7a8d] text-sm leading-relaxed mb-5">
+                    Jastine is responsible for quality assurance and testing in AquaQueue, evaluating system performance, checking for errors, 
+                    and ensuring that all features work correctly before deployment.
+
+
+                </p>
+                <div class="flex justify-center gap-2">
+                    <a href="mailto:jastine.metante@gmail.com" class="social-btn" title="Email"><i class="fas fa-envelope"></i></a>
                     <a href="#" class="social-btn" title="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
                     <a href="#" class="social-btn" title="GitHub"><i class="fab fa-github"></i></a>
                 </div>
